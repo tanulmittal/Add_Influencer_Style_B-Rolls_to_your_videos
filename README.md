@@ -38,21 +38,33 @@ insta-reel-edit/
 │       ├── SKILL.md
 │       └── agents/
 │           └── openai.yaml
-└── examples/
-    └── project-template/
-        ├── input/
-        │   ├── video.mp4
-        │   └── captions.srt
-        ├── B_roll/
-        └── output/
+├── project-template/
+│   ├── PLACE_SOURCE_FILES_HERE.md
+│   ├── B_roll/
+│   └── output/
+└── skills/
+    └── insta-reel-edit/
+        ├── SKILL.md
+        └── agents/
+            └── openai.yaml
 ```
 
-For real use, each project folder should look like:
+For real use, put your source files in a folder like `project-template/` or any folder with the same structure:
 
 ```text
 project-name/
-├── source.mp4
-├── source.srt
+├── your-video-name.mp4
+├── your-video-srt-name.srt
+├── B_roll/
+└── output/
+```
+
+Example:
+
+```text
+project-template/
+├── my-reel.mp4
+├── my-reel.srt
 ├── B_roll/
 └── output/
 ```
@@ -80,7 +92,7 @@ python3 build_srt_edit.py "<project-folder>"
 Example:
 
 ```bash
-python3 build_srt_edit.py "ChatGpt $100"
+python3 build_srt_edit.py "project-template"
 ```
 
 Current output files:
