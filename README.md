@@ -1,4 +1,4 @@
-# AI B-Roll Generator
+# Add Influencer Style B-Rolls to your videos
 
 Add Influencer Style - B-Rolls to your videos (current support 9:16 videos)
 
