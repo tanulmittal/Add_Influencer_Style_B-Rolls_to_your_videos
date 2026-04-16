@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import re
 import shutil
@@ -10,12 +11,16 @@ import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from PIL import Image, ImageDraw, ImageFont
+
+from broll_prompts import generate_broll_prompts_for_project
+
 WIDTH = 1080
 HEIGHT = 1920
 TEMPLATE2_BROLL_HEIGHT = int(HEIGHT * 0.4)
 TEMPLATE2_AROLL_Y = int(HEIGHT * 0.3)
 BROLL_START_ZOOM = 1.0
-BROLL_END_ZOOM = 1.2
+BROLL_END_ZOOM = 1.1
 MIN_EDGE_DURATION = 1.0
 MAX_EDGE_DURATION = 3.0
 MIDDLE_BROLL_DURATION = 2.0
@@ -95,6 +100,17 @@ class Segment:
 
 def run(cmd: list[str], cwd: Path | None = None) -> None:
     subprocess.run(cmd, cwd=str(cwd) if cwd else None, check=True)
+
+
+@functools.lru_cache(maxsize=1)
+def ffmpeg_has_filter(name: str) -> bool:
+    result = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-filters"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return any(line.split()[-1] == name for line in result.stdout.splitlines() if line.strip())
 
 
 def probe_video(video_path: Path) -> tuple[float, int]:
@@ -308,9 +324,45 @@ def placeholder_text_style(template: str) -> tuple[int, int]:
     return 16, 36
 
 
+def create_placeholder_image_with_pillow(
+    output_path: Path,
+    label: str,
+    font_path: str | None,
+    font_size: int,
+    width: int,
+    height: int,
+) -> None:
+    image = Image.new("RGB", (width, height), "#111827")
+    draw = ImageDraw.Draw(image)
+    if font_path:
+        font = ImageFont.truetype(font_path, font_size)
+    else:
+        font = ImageFont.load_default()
+    left, top, right, bottom = draw.multiline_textbbox(
+        (0, 0),
+        label,
+        font=font,
+        align="center",
+        spacing=12,
+    )
+    text_width = right - left
+    text_height = bottom - top
+    position = ((width - text_width) / 2, (height - text_height) / 2)
+    draw.multiline_text(
+        position,
+        label,
+        font=font,
+        fill="white",
+        align="center",
+        spacing=12,
+    )
+    image.save(output_path)
+
+
 def create_placeholder_images(broll_dir: Path, segments: list[Segment], overwrite: bool) -> None:
     broll_dir.mkdir(parents=True, exist_ok=True)
     font_path = pick_font()
+    can_drawtext = bool(font_path) and ffmpeg_has_filter("drawtext")
     label_dir = broll_dir / ".label_cache"
     label_dir.mkdir(exist_ok=True)
     for segment in segments:
@@ -327,6 +379,16 @@ def create_placeholder_images(broll_dir: Path, segments: list[Segment], overwrit
         label_path = label_dir / f"{output_path.stem}.txt"
         label_path.write_text(label, encoding="utf-8")
         placeholder_width, placeholder_height = broll_dimensions_for_template(segment.template)
+        if not can_drawtext:
+            create_placeholder_image_with_pillow(
+                output_path=output_path,
+                label=label,
+                font_path=font_path,
+                font_size=font_size,
+                width=placeholder_width,
+                height=placeholder_height,
+            )
+            continue
         drawtext = (
             "drawtext="
             f"fontfile='{font_path}':"
@@ -336,7 +398,7 @@ def create_placeholder_images(broll_dir: Path, segments: list[Segment], overwrit
             "x=(w-text_w)/2:"
             "y=(h-text_h)/2:"
             "line_spacing=12"
-        ) if font_path else None
+        ) if can_drawtext else None
         vf = [drawtext] if drawtext else []
         run(
             [
@@ -410,6 +472,56 @@ def write_edit_plan(output_path: Path, video_path: Path, srt_path: Path, segment
         "segments": [asdict(segment) for segment in segments],
     }
     output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def load_segments_from_edit_plan(edit_plan_path: Path) -> list[Segment]:
+    try:
+        payload = json.loads(edit_plan_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise SystemExit(
+            f"Missing edit plan: {edit_plan_path}. Run create.py for this folder first."
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"Invalid JSON in {edit_plan_path}: {exc}") from exc
+
+    raw_segments = payload.get("segments")
+    if not isinstance(raw_segments, list):
+        raise SystemExit(f"Malformed edit plan {edit_plan_path}: missing 'segments' list.")
+
+    segments: list[Segment] = []
+    required_keys = ("index", "start", "end", "duration", "text", "template")
+    for raw_segment in raw_segments:
+        if not isinstance(raw_segment, dict):
+            raise SystemExit(f"Malformed edit plan {edit_plan_path}: each segment must be an object.")
+        missing_keys = [key for key in required_keys if key not in raw_segment]
+        if missing_keys:
+            joined = ", ".join(missing_keys)
+            raise SystemExit(
+                f"Malformed edit plan {edit_plan_path}: segment missing required keys: {joined}."
+            )
+        broll_file = raw_segment.get("broll_file")
+        if broll_file is not None and not isinstance(broll_file, str):
+            raise SystemExit(
+                f"Malformed edit plan {edit_plan_path}: segment broll_file must be a string or null."
+            )
+        try:
+            segments.append(
+                Segment(
+                    index=int(raw_segment["index"]),
+                    start=float(raw_segment["start"]),
+                    end=float(raw_segment["end"]),
+                    duration=float(raw_segment["duration"]),
+                    text=str(raw_segment["text"]),
+                    template=str(raw_segment["template"]),
+                    broll_file=broll_file,
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            raise SystemExit(
+                f"Malformed edit plan {edit_plan_path}: invalid segment field types."
+            ) from exc
+
+    return segments
 
 
 def build_filter_complex(
@@ -609,6 +721,7 @@ def main() -> int:
     )
     remove_unused_broll_files(broll_dir, segments)
     write_edit_plan(output_dir / "edit_plan.json", video_path, srt_path, segments)
+    generate_broll_prompts_for_project(folder)
     output_path = render_video(
         folder=folder,
         video_path=video_path,

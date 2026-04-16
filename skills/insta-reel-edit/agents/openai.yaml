@@ -1,4 +1,0 @@
-interface:
-  display_name: "Insta Reel Edit"
-  short_description: "Edit 9:16 reels with A-roll/B-roll template workflows."
-  default_prompt: "Use this skill to build or adjust a 9:16 reel edit from one source video, one SRT, and local B-roll PNG assets."
