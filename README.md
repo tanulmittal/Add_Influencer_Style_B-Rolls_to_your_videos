@@ -1,6 +1,6 @@
 # Add Influencer Style B-Rolls to Your Videos
 
-Create a 9:16 talking-head edit from a single source video. The tool:
+Create a 9:16 talking-head edit from a single source video.
 
 ## Preview
 
@@ -11,6 +11,8 @@ Create a 9:16 talking-head edit from a single source video. The tool:
 ### After
 
 ![After edit](assets/readme/after.gif)
+
+The tool:
 
 - transcribes the video with Groq
 - generates `output/transcript.srt`
