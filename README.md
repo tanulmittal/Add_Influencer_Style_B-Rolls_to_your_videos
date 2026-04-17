@@ -2,6 +2,16 @@
 
 Add Influencer Style - B-Rolls to your videos (current support 9:16 videos)
 
+## Preview
+
+### Before
+
+![Before edit](assets/readme/before.gif)
+
+### After
+
+![After edit](assets/readme/after.gif)
+
 Create an edited video using:
 
 - `video.mp4`
@@ -22,6 +32,19 @@ your-project/
 
 ```bash
 python3 create.py your-project
+```
+
+Subtitles are burned into the output by default using the project SRT timing.
+
+- Font: `Inter`
+- Size: `37px`
+- Style: white text with a black `75%` opacity rounded background box
+- Placement: bottom-center in the lower safe area
+
+To skip subtitles for a render, use:
+
+```bash
+python3 create.py your-project --no-subs
 ```
 
 ## OpenRouter Setup
@@ -54,6 +77,12 @@ Replace the generated temporary images inside `B_roll/` with your own image B-ro
 
 ```bash
 python3 recreate.py your-project
+```
+
+To rerender without subtitles:
+
+```bash
+python3 recreate.py your-project --no-subs
 ```
 
 Your influencer explainer video will be ready in:

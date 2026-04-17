@@ -10,6 +10,7 @@ from create import (
     discover_single_file,
     has_audio_stream,
     load_segments_from_edit_plan,
+    parse_srt,
     probe_video,
     render_video,
 )
@@ -34,6 +35,19 @@ def main() -> int:
         description="Rerender a project using the existing output/edit_plan.json and current B-roll files."
     )
     parser.add_argument("folder", help="Project folder to rerender.")
+    parser.add_argument(
+        "--burn-subs",
+        dest="burn_subtitles",
+        action="store_true",
+        help="Backward-compatible alias for enabling burned-in subtitles.",
+    )
+    parser.add_argument(
+        "--no-subs",
+        dest="burn_subtitles",
+        action="store_false",
+        help="Render without burned-in subtitles.",
+    )
+    parser.set_defaults(burn_subtitles=True)
     args = parser.parse_args()
 
     folder = Path(args.folder).resolve()
@@ -49,6 +63,7 @@ def main() -> int:
 
     video_path = discover_single_file(folder, (".mp4", ".mov", ".m4v"))
     srt_path = discover_single_file(folder, (".srt",))
+    cues = parse_srt(srt_path)
     _, fps = probe_video(video_path)
     segments = load_segments_from_edit_plan(edit_plan_path)
     broll_dir = folder / "B_roll"
@@ -61,9 +76,10 @@ def main() -> int:
         output_dir=output_dir,
         broll_dir=broll_dir,
         segments=segments,
+        cues=cues,
         fps=fps,
         include_audio=has_audio_stream(video_path),
-        burn_subtitles=False,
+        burn_subtitles=args.burn_subtitles,
     )
     print(f"Rendered {output_path}")
     return 0

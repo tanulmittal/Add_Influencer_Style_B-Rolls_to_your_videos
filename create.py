@@ -4,8 +4,8 @@ from __future__ import annotations
 import argparse
 import functools
 import json
+import math
 import re
-import shutil
 import subprocess
 import sys
 from dataclasses import asdict, dataclass
@@ -19,6 +19,15 @@ WIDTH = 1080
 HEIGHT = 1920
 TEMPLATE2_BROLL_HEIGHT = int(HEIGHT * 0.4)
 TEMPLATE2_AROLL_Y = int(HEIGHT * 0.3)
+SUBTITLE_FONT_SIZE = 37
+SUBTITLE_TEXT_MAX_WIDTH = int(WIDTH * 0.72)
+SUBTITLE_PADDING_X = 28
+SUBTITLE_PADDING_Y = 18
+SUBTITLE_CORNER_RADIUS = 22
+SUBTITLE_LINE_SPACING = 8
+SUBTITLE_BOTTOM_MARGIN = int(HEIGHT * 0.2)
+SUBTITLE_BOX_FILL = (0, 0, 0, 191)
+SUBTITLE_TEXT_FILL = (255, 255, 255, 255)
 BROLL_START_ZOOM = 1.0
 BROLL_END_ZOOM = 1.1
 MIN_EDGE_DURATION = 1.0
@@ -96,6 +105,13 @@ class Segment:
     text: str
     template: str
     broll_file: str | None
+
+
+@dataclass
+class SubtitleCard:
+    start: float
+    end: float
+    image_path: Path
 
 
 def run(cmd: list[str], cwd: Path | None = None) -> None:
@@ -287,7 +303,7 @@ def assign_templates(segments: list[Segment]) -> None:
             segment.broll_file = None
 
 
-def pick_font() -> str | None:
+def pick_placeholder_font() -> str | None:
     candidates = [
         Path("/System/Library/Fonts/Supplemental/Arial Bold.ttf"),
         Path("/System/Library/Fonts/Supplemental/Arial.ttf"),
@@ -297,6 +313,43 @@ def pick_font() -> str | None:
         if candidate.exists():
             return str(candidate)
     return None
+
+
+def pick_inter_font() -> str:
+    direct_candidates = [
+        Path(__file__).resolve().parent / "fonts" / "Inter[opsz,wght].ttf",
+        Path(__file__).resolve().parent / "fonts" / "Inter-Regular.ttf",
+        Path(__file__).resolve().parent / "fonts" / "Inter.ttf",
+        Path("/Library/Fonts/Inter-Regular.ttf"),
+        Path("/Library/Fonts/Inter.ttf"),
+        Path.home() / "Library" / "Fonts" / "Inter-Regular.ttf",
+        Path.home() / "Library" / "Fonts" / "Inter.ttf",
+        Path.home() / ".fonts" / "Inter-Regular.ttf",
+        Path.home() / ".fonts" / "Inter.ttf",
+    ]
+    for candidate in direct_candidates:
+        if candidate.exists():
+            return str(candidate)
+
+    search_dirs = [
+        Path(__file__).resolve().parent / "fonts",
+        Path("/Library/Fonts"),
+        Path.home() / "Library" / "Fonts",
+        Path.home() / ".fonts",
+    ]
+    patterns = ("Inter*.ttf", "Inter*.otf", "Inter*.ttc")
+    for search_dir in search_dirs:
+        if not search_dir.exists():
+            continue
+        for pattern in patterns:
+            for candidate in sorted(search_dir.glob(pattern)):
+                if candidate.is_file():
+                    return str(candidate)
+    raise SystemExit(
+        "Inter font not found. Install a local Inter .ttf file (for example "
+        "/Library/Fonts/Inter-Regular.ttf or ~/Library/Fonts/Inter-Regular.ttf) "
+        "and rerun the render."
+    )
 
 
 def wrap_placeholder_label(text: str, max_chars: int) -> str:
@@ -361,7 +414,7 @@ def create_placeholder_image_with_pillow(
 
 def create_placeholder_images(broll_dir: Path, segments: list[Segment], overwrite: bool) -> None:
     broll_dir.mkdir(parents=True, exist_ok=True)
-    font_path = pick_font()
+    font_path = pick_placeholder_font()
     can_drawtext = bool(font_path) and ffmpeg_has_filter("drawtext")
     label_dir = broll_dir / ".label_cache"
     label_dir.mkdir(exist_ok=True)
@@ -416,6 +469,97 @@ def create_placeholder_images(broll_dir: Path, segments: list[Segment], overwrit
                 str(output_path),
             ]
         )
+
+
+def measure_text_width(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont) -> int:
+    left, _, right, _ = draw.textbbox((0, 0), text, font=font)
+    return right - left
+
+
+def wrap_text_to_pixel_width(
+    text: str,
+    draw: ImageDraw.ImageDraw,
+    font: ImageFont.FreeTypeFont,
+    max_width: int,
+) -> str:
+    words = text.split()
+    if not words:
+        return ""
+
+    lines: list[str] = []
+    current = words[0]
+    for word in words[1:]:
+        candidate = f"{current} {word}"
+        if measure_text_width(draw, candidate, font) <= max_width:
+            current = candidate
+            continue
+        lines.append(current)
+        current = word
+    lines.append(current)
+    return "\n".join(lines)
+
+
+def render_subtitle_card(
+    output_path: Path,
+    text: str,
+    font_path: str,
+) -> None:
+    scratch = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(scratch)
+    font = ImageFont.truetype(font_path, SUBTITLE_FONT_SIZE)
+    wrapped_text = wrap_text_to_pixel_width(text, draw, font, SUBTITLE_TEXT_MAX_WIDTH)
+    left, top, right, bottom = draw.multiline_textbbox(
+        (0, 0),
+        wrapped_text,
+        font=font,
+        align="center",
+        spacing=SUBTITLE_LINE_SPACING,
+    )
+    text_width = right - left
+    text_height = bottom - top
+    image_width = math.ceil(text_width + SUBTITLE_PADDING_X * 2)
+    image_height = math.ceil(text_height + SUBTITLE_PADDING_Y * 2)
+
+    image = Image.new("RGBA", (image_width, image_height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle(
+        (0, 0, image_width - 1, image_height - 1),
+        radius=SUBTITLE_CORNER_RADIUS,
+        fill=SUBTITLE_BOX_FILL,
+    )
+    draw.multiline_text(
+        ((image_width - text_width) / 2 - left, (image_height - text_height) / 2 - top),
+        wrapped_text,
+        font=font,
+        fill=SUBTITLE_TEXT_FILL,
+        align="center",
+        spacing=SUBTITLE_LINE_SPACING,
+    )
+    image.save(output_path)
+
+
+def build_subtitle_cards(output_dir: Path, cues: list[Cue]) -> list[SubtitleCard]:
+    subtitle_dir = output_dir / "subtitle_cards"
+    subtitle_dir.mkdir(parents=True, exist_ok=True)
+    for existing_file in subtitle_dir.glob("*.png"):
+        existing_file.unlink()
+
+    font_path = pick_inter_font()
+    subtitle_cards: list[SubtitleCard] = []
+    for cue in cues:
+        cleaned_text = clean_caption_text(cue.text)
+        if not cleaned_text or cue.end <= cue.start:
+            continue
+        image_path = subtitle_dir / f"cue_{cue.index:04d}.png"
+        render_subtitle_card(image_path, cleaned_text, font_path)
+        subtitle_cards.append(
+            SubtitleCard(
+                start=cue.start,
+                end=cue.end,
+                image_path=image_path,
+            )
+        )
+    return subtitle_cards
 
 
 def broll_dimensions_for_template(template: str) -> tuple[int, int]:
@@ -528,6 +672,7 @@ def build_filter_complex(
     segments: list[Segment],
     include_audio: bool,
     image_inputs: dict[str, int],
+    subtitle_cards: list[SubtitleCard],
     burn_subtitles: bool,
     fps: int,
 ) -> tuple[str, str, str]:
@@ -605,15 +750,18 @@ def build_filter_complex(
     )
     video_label = "concat_v"
     if burn_subtitles:
-        style = (
-            "FontName=Arial,FontSize=18,PrimaryColour=&H00FFFFFF&,"
-            "OutlineColour=&H00000000&,BorderStyle=1,Outline=2,Shadow=0,"
-            "Alignment=2,MarginV=80"
-        )
-        filters.append(
-            f"[concat_v]subtitles=filename='captions_render.srt':force_style='{style}'[final_v]"
-        )
-        video_label = "final_v"
+        for subtitle_index, subtitle_card in enumerate(subtitle_cards):
+            next_label = f"sub{subtitle_index}"
+            input_index = image_inputs[str(subtitle_card.image_path)]
+            filters.append(
+                f"[{video_label}][{input_index}:v]"
+                f"overlay=shortest=1:"
+                f"x=(main_w-overlay_w)/2:"
+                f"y=main_h-{SUBTITLE_BOTTOM_MARGIN}-overlay_h:"
+                f"enable='between(t,{subtitle_card.start:.3f},{subtitle_card.end:.3f})'"
+                f"[{next_label}]"
+            )
+            video_label = next_label
     return ";".join(filters), video_label, "concat_a"
 
 
@@ -624,6 +772,7 @@ def render_video(
     output_dir: Path,
     broll_dir: Path,
     segments: list[Segment],
+    cues: list[Cue],
     fps: int,
     include_audio: bool,
     burn_subtitles: bool,
@@ -635,13 +784,18 @@ def render_video(
         image_inputs[segment.broll_file] = position
         command.extend(["-loop", "1", "-i", str(broll_dir / segment.broll_file)])
 
+    subtitle_cards: list[SubtitleCard] = []
     if burn_subtitles:
-        shutil.copyfile(srt_path, output_dir / "captions_render.srt")
+        subtitle_cards = build_subtitle_cards(output_dir, cues)
+        for card in subtitle_cards:
+            image_inputs[str(card.image_path)] = len(image_inputs) + 1
+            command.extend(["-loop", "1", "-i", str(card.image_path)])
 
     filter_complex, video_label, audio_label = build_filter_complex(
         segments=segments,
         include_audio=include_audio,
         image_inputs=image_inputs,
+        subtitle_cards=subtitle_cards,
         burn_subtitles=burn_subtitles,
         fps=fps,
     )
@@ -694,9 +848,17 @@ def main() -> int:
     )
     parser.add_argument(
         "--burn-subs",
+        dest="burn_subtitles",
         action="store_true",
-        help="Burn the provided SRT onto the final output.",
+        help="Backward-compatible alias for enabling burned-in subtitles.",
     )
+    parser.add_argument(
+        "--no-subs",
+        dest="burn_subtitles",
+        action="store_false",
+        help="Render without burned-in subtitles.",
+    )
+    parser.set_defaults(burn_subtitles=True)
     args = parser.parse_args()
 
     folder = Path(args.folder).resolve()
@@ -729,9 +891,10 @@ def main() -> int:
         output_dir=output_dir,
         broll_dir=broll_dir,
         segments=segments,
+        cues=cues,
         fps=fps,
         include_audio=has_audio_stream(video_path),
-        burn_subtitles=args.burn_subs,
+        burn_subtitles=args.burn_subtitles,
     )
     print(f"Rendered {output_path}")
     return 0
