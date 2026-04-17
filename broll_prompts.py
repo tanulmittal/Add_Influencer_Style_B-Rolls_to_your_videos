@@ -9,7 +9,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from openai import APIError, OpenAI, RateLimitError
+from groq import Groq
 
 
 @dataclass
@@ -21,105 +21,31 @@ class PromptEntry:
     prompt: str
 
 
-SCHOLARSHIP_TERMS = (
-    "scholarship",
-    "scholarships",
-    "merit",
-    "funding",
-    "funded",
-    "financial aid",
-    "percent",
-    "%",
-)
-UNIVERSITY_TERMS = (
-    "university",
-    "universities",
-    "campus",
-    "australia",
-    "australian",
-    "anu",
-    "go8",
-    "monash",
-    "sydney",
-    "destination",
-    "global",
-    "world-class",
-)
-GUIDANCE_TERMS = (
-    "guidance",
-    "support",
-    "application",
-    "apply",
-    "shortlisting",
-    "course",
-    "counselor",
-    "counsellor",
-    "advisor",
-    "adviser",
-    "help",
-)
-EVENT_TERMS = (
-    "event",
-    "join",
-    "office",
-    "meet",
-    "visit",
-    "april",
-    "am",
-    "pm",
-    "day",
-)
-CLARITY_TERMS = (
-    "confused",
-    "clarity",
-    "future",
-    "opportunity",
-    "upgrade",
-    "chance",
-    "planning",
-    "realize",
-)
-CTA_TERMS = (
-    "follow",
-    "more",
-    "scrolling",
-    "stop scrolling",
-)
-MONTH_TERMS = (
-    "january",
-    "february",
-    "march",
-    "april",
-    "may",
-    "june",
-    "july",
-    "august",
-    "september",
-    "october",
-    "november",
-    "december",
-)
-
-STYLE_SUFFIX = (
-    "photorealistic commercial photography, premium education marketing campaign, "
-    "cinematic natural lighting, aspirational student-focused mood, polished realistic details, "
-    "clean composition, no text, no logos, no watermark"
-)
 TEMPLATE_2_FRAMING = (
     "wide horizontal composition designed for a clean top-strip banner crop above talking-head footage, "
-    "strong subject placement with clear negative space and balanced upper-frame composition"
+    "clear subject placement with balanced negative space and a clean upper frame"
 )
 TEMPLATE_3_FRAMING = (
     "full-scene vertical composition for immersive full-screen 9:16 b-roll, "
-    "rich depth, cinematic framing, strong storytelling through environment"
+    "cinematic depth, strong environmental storytelling, and clean crop-safe framing"
 )
 DEFAULT_FRAMING = (
-    "full-frame composition with clear focal subject and flexible crop-safe framing"
+    "clean full-frame composition with a clear focal subject and flexible crop-safe framing"
 )
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-DEFAULT_OPENROUTER_MODEL = "google/gemma-4-26b-a4b-it:free"
-DEFAULT_OPENROUTER_TIMEOUT_SECONDS = 8.0
+DEFAULT_GROQ_PROMPT_MODEL = "openai/gpt-oss-20b"
 REPO_ROOT = Path(__file__).resolve().parent
+DISALLOWED_RESPONSE_PATTERNS = (
+    r"\b[\w-]+\.(?:mp4|srt|py|json|md|png)\b",
+    r"\b(?:university|campus|scholarship|admissions|classroom)\b",
+)
+DISALLOWED_RESPONSE_PHRASES = (
+    "folder named",
+    "file named",
+    "labeled ",
+    "labelled ",
+    "readable text",
+    "ui copy",
+)
 
 
 def load_edit_plan(edit_plan_path: Path) -> dict:
@@ -134,7 +60,6 @@ def load_edit_plan(edit_plan_path: Path) -> dict:
     segments = payload.get("segments")
     if not isinstance(segments, list):
         raise SystemExit(f"Malformed edit plan {edit_plan_path}: missing 'segments' list.")
-
     return payload
 
 
@@ -156,106 +81,31 @@ def load_local_env() -> None:
 
 
 def normalize_text(text: str) -> str:
-    cleaned = re.sub(r"\s+", " ", text).strip()
-    return cleaned
+    return re.sub(r"\s+", " ", text).strip()
 
 
-def contains_any(text: str, terms: tuple[str, ...]) -> bool:
-    for term in terms:
-        if " " in term or not term.isalnum():
-            if term in text:
-                return True
-            continue
-        if re.search(rf"\b{re.escape(term)}\b", text):
-            return True
-    return False
+def sanitize_context_text(text: str) -> str:
+    normalized = normalize_text(text)
+    replacements = {
+        "video.mp4": "a source video",
+        "audio.srt": "a generated subtitle transcript",
+        "transcript.srt": "a generated subtitle transcript",
+        "create.py": "the main build script",
+        "recreate.py": "the rerender script",
+        "9-16": "9:16",
+        "p-roll": "B-roll",
+    }
+    lowered = normalized.lower()
+    for source, target in replacements.items():
+        lowered = lowered.replace(source, target)
+    return re.sub(r"\s+", " ", lowered).strip()
 
 
-def build_project_context(text: str) -> str:
-    context_bits: list[str] = []
-    lower = text.lower()
-
-    if "anu" in lower:
-        context_bits.append(
-            "an ambitious student in an elite Australian university setting inspired by Canberra"
-        )
-    elif "sydney" in lower:
-        context_bits.append(
-            "students in a prestigious urban Australian campus environment inspired by Sydney"
-        )
-    elif "monash" in lower:
-        context_bits.append(
-            "students in a modern high-achievement Australian campus setting inspired by Monash"
-        )
-    elif "go8" in lower:
-        context_bits.append(
-            "a premium Australian Group of Eight university atmosphere"
-        )
-    elif "australia" in lower or "australian" in lower:
-        context_bits.append(
-            "an aspirational Australian higher-education environment"
-        )
-
-    if "planet education" in lower:
-        context_bits.append(
-            "a professional education consultancy environment without visible branding"
-        )
-
-    return ", ".join(context_bits)
-
-
-def build_scene_description(segment_text: str) -> str:
-    lower = normalize_text(segment_text).lower()
-    project_context = build_project_context(lower)
-    context_suffix = f", {project_context}" if project_context else ""
-
-    if contains_any(lower, SCHOLARSHIP_TERMS):
-        return (
-            "a confident prospective student reviewing scholarship success and admissions options "
-            "with an expert advisor in a polished counseling session"
-            f"{context_suffix}"
-        )
-
-    if contains_any(lower, UNIVERSITY_TERMS):
-        return (
-            "ambitious students experiencing a world-class campus environment, walking through a "
-            "premium academic setting that feels globally respected and future-focused"
-            f"{context_suffix}"
-        )
-
-    if contains_any(lower, GUIDANCE_TERMS):
-        return (
-            "a one-on-one admissions planning session with a student and advisor reviewing course "
-            "options on a laptop in a bright modern consultation space"
-            f"{context_suffix}"
-        )
-
-    if contains_any(lower, EVENT_TERMS) or contains_any(lower, MONTH_TERMS):
-        return (
-            "an energetic university admissions event scene with students checking in, meeting "
-            "advisors, and exploring opportunities in a welcoming consultation venue"
-            f"{context_suffix}"
-        )
-
-    if contains_any(lower, CLARITY_TERMS):
-        return (
-            "a focused student in a moment of clarity and motivation, planning their academic "
-            "future with confidence in a premium study-oriented environment"
-            f"{context_suffix}"
-        )
-
-    if contains_any(lower, CTA_TERMS):
-        return (
-            "a modern student browsing education opportunities on a phone or laptop in a clean, "
-            "aspirational study space with no readable screen text"
-            f"{context_suffix}"
-        )
-
-    return (
-        "an aspirational student success scene in a premium higher-education environment, "
-        "capturing ambition, opportunity, and forward momentum"
-        f"{context_suffix}"
-    )
+def truncate_text(text: str, limit: int) -> str:
+    normalized = normalize_text(text)
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: limit - 3].rstrip() + "..."
 
 
 def framing_for_template(template: str) -> str:
@@ -266,58 +116,18 @@ def framing_for_template(template: str) -> str:
     return DEFAULT_FRAMING
 
 
-def build_rule_based_prompt(segment_text: str, template: str) -> str:
-    scene_description = build_scene_description(segment_text)
-    framing = framing_for_template(template)
-    return (
-        f"Photorealistic cinematic marketing image of {scene_description}, "
-        f"{framing}, {STYLE_SUFFIX}."
-    )
-
-
-def prompt_provider() -> str:
+def groq_prompt_model() -> str:
     load_local_env()
-    provider = os.environ.get("BROLL_PROMPT_PROVIDER", "").strip().lower()
-    if provider in {"openrouter", "rule-based"}:
-        return provider
-    if os.environ.get("OPENROUTER_API_KEY"):
-        return "openrouter"
-    return "rule-based"
-
-
-def openrouter_model() -> str:
-    load_local_env()
-    return os.environ.get("OPENROUTER_MODEL", DEFAULT_OPENROUTER_MODEL)
-
-
-def openrouter_fallback_models() -> list[str]:
-    load_local_env()
-    raw_value = os.environ.get("OPENROUTER_FALLBACK_MODELS", "")
-    return [part.strip() for part in raw_value.split(",") if part.strip()]
-
-
-def openrouter_timeout_seconds() -> float:
-    load_local_env()
-    raw_value = os.environ.get("OPENROUTER_TIMEOUT_SECONDS", "").strip()
-    if not raw_value:
-        return DEFAULT_OPENROUTER_TIMEOUT_SECONDS
-    try:
-        return max(1.0, float(raw_value))
-    except ValueError:
-        return DEFAULT_OPENROUTER_TIMEOUT_SECONDS
+    return os.environ.get("GROQ_PROMPT_MODEL", DEFAULT_GROQ_PROMPT_MODEL)
 
 
 @functools.lru_cache(maxsize=1)
-def get_openrouter_client() -> OpenAI:
+def get_groq_client() -> Groq:
     load_local_env()
-    api_key = os.environ.get("OPENROUTER_API_KEY")
+    api_key = os.environ.get("GROQ_API_KEY")
     if not api_key:
-        raise SystemExit("OPENROUTER_API_KEY is not set.")
-    return OpenAI(
-        base_url=OPENROUTER_BASE_URL,
-        api_key=api_key,
-        max_retries=0,
-    )
+        raise SystemExit("GROQ_API_KEY is not set.")
+    return Groq(api_key=api_key)
 
 
 def flatten_message_content(content: object) -> str:
@@ -334,7 +144,7 @@ def flatten_message_content(content: object) -> str:
     return ""
 
 
-def sanitize_openrouter_prompt(content: str, fallback_prompt: str) -> str:
+def sanitize_remote_prompt(content: str, fallback_prompt: str) -> str:
     prompt = content.strip()
     if not prompt:
         return fallback_prompt
@@ -344,71 +154,139 @@ def sanitize_openrouter_prompt(content: str, fallback_prompt: str) -> str:
     prompt = re.sub(r"\s+", " ", prompt)
     if not prompt:
         return fallback_prompt
+    lower_prompt = prompt.lower()
+    if any(phrase in lower_prompt for phrase in DISALLOWED_RESPONSE_PHRASES):
+        return fallback_prompt
+    if any(re.search(pattern, prompt, re.IGNORECASE) for pattern in DISALLOWED_RESPONSE_PATTERNS):
+        return fallback_prompt
     if not prompt.endswith("."):
         prompt += "."
     return prompt
 
 
-def build_openrouter_prompt(segment_text: str, template: str) -> str:
-    fallback_prompt = build_rule_based_prompt(segment_text, template)
-    scene_description = build_scene_description(segment_text)
+def build_project_context(segments: list[dict]) -> str:
+    context_parts: list[str] = []
+    for raw_segment in segments:
+        text = sanitize_context_text(str(raw_segment.get("text", "")))
+        if not text or text in context_parts:
+            continue
+        context_parts.append(text)
+        if len(" | ".join(context_parts)) >= 500:
+            break
+    return truncate_text(" | ".join(context_parts), 500)
+
+
+def find_neighbor_text(segments: list[dict], start_index: int, step: int) -> str:
+    cursor = start_index + step
+    while 0 <= cursor < len(segments):
+        candidate = sanitize_context_text(str(segments[cursor].get("text", "")))
+        if candidate:
+            return candidate
+        cursor += step
+    return ""
+
+
+def build_fallback_prompt(
+    segment_text: str,
+    template: str,
+    previous_text: str,
+    next_text: str,
+    project_context: str,
+) -> str:
     framing = framing_for_template(template)
-    client = get_openrouter_client()
-    models_to_try = [openrouter_model(), *openrouter_fallback_models()]
+    context_bits = [f"centered on the spoken beat: {segment_text}"]
+    if previous_text:
+        context_bits.append(f"story beat before this: {truncate_text(previous_text, 120)}")
+    if next_text:
+        context_bits.append(f"story beat after this: {truncate_text(next_text, 120)}")
+    if project_context:
+        context_bits.append(f"overall project context: {project_context}")
+    return (
+        "Photorealistic cinematic B-roll of a creator or developer workflow, "
+        + ", ".join(context_bits)
+        + f", with {framing}. Show recording, editing, rendering, laptop, phone, or desk-based production energy in a realistic workspace. "
+        "Keep the visual literal to the software or tutorial context, with clean composition, natural cinematic lighting, and no readable text, logos, or watermark."
+    )
+
+
+def build_groq_prompt(
+    segment_text: str,
+    template: str,
+    previous_text: str,
+    next_text: str,
+    project_context: str,
+) -> str:
+    fallback_prompt = build_fallback_prompt(
+        segment_text=segment_text,
+        template=template,
+        previous_text=previous_text,
+        next_text=next_text,
+        project_context=project_context,
+    )
+    client = get_groq_client()
     messages = [
         {
             "role": "system",
             "content": (
-                "You write single-paragraph prompts for AI image generation. "
-                "Return only the final prompt text. "
-                "Do not use markdown, bullets, labels, JSON, or explanations. "
-                "Never request readable text, dates, logos, posters, watermarks, or branded signage inside the image. "
-                "Keep prompts photorealistic, cinematic, aspirational, and suitable for education marketing B-roll."
+                "You write single-paragraph image prompts for B-roll still generation. "
+                "The spoken segment is the primary source of truth. "
+                "Keep the scene literal to the line first, then add cinematic polish. "
+                "Prefer creator, software, editing, developer, recording, laptop, phone, workspace, and tutorial-adjacent visuals "
+                "when the segment is about repos, tools, code, editing, or product demos. "
+                "Do not drift into unrelated stock themes like campuses, scholarships, admissions, classrooms, or generic student success "
+                "unless those are explicitly present in the provided transcript context. "
+                "Do not include readable text, UI copy, logos, watermarks, posters, or signage. "
+                "Return only the final prompt text."
             ),
         },
         {
             "role": "user",
             "content": (
-                "Rewrite this into a stronger image-generation prompt.\n"
-                f"Segment text: {segment_text}\n"
-                f"Visual direction: {scene_description}\n"
-                f"Framing requirement: {framing}\n"
-                "Hard requirements: model-agnostic wording, premium commercial photography look, "
-                "clean composition, natural cinematic lighting, student-focused scene, "
-                "no text, no logos, no watermark.\n"
-                "Return exactly one final prompt."
+                f"Current segment: {segment_text}\n"
+                f"Previous segment: {previous_text or 'None'}\n"
+                f"Next segment: {next_text or 'None'}\n"
+                f"Project context: {project_context or 'None'}\n"
+                f"Framing requirement: {framing_for_template(template)}\n"
+                "Write a literal-but-cinematic image prompt for this segment. "
+                "If the line references a software repo, editing workflow, subtitles, rendering, B-roll, or creator tooling, "
+                "the visual should stay inside that world. "
+                "Describe screens and interfaces abstractly. "
+                "Do not mention filenames, script names, folder names, commands, quoted labels, readable screen text, logos, or watermark."
             ),
         },
     ]
 
-    last_error: str | None = None
-    for model_name in models_to_try:
-        try:
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=messages,
-                timeout=openrouter_timeout_seconds(),
-                extra_body={"reasoning": {"enabled": True}},
-            )
-            message = response.choices[0].message
-            content = flatten_message_content(message.content)
-            return sanitize_openrouter_prompt(content, fallback_prompt)
-        except (RateLimitError, APIError) as exc:
-            last_error = f"{model_name}: {exc}"
-            continue
+    try:
+        response = client.chat.completions.create(
+            model=groq_prompt_model(),
+            messages=messages,
+        )
+        message = response.choices[0].message
+        content = flatten_message_content(message.content)
+        return sanitize_remote_prompt(content, fallback_prompt)
+    except Exception as exc:
+        print(
+            "Warning: Groq prompt generation failed; using deterministic fallback prompt."
+            + f" Last error: {exc}",
+            file=sys.stderr,
+        )
+        return fallback_prompt
 
-    print(
-        "Warning: OpenRouter prompt generation failed; using local fallback prompt builder."
-        + (f" Last error: {last_error}" if last_error else ""),
-        file=sys.stderr,
+
+def build_prompt(
+    segment_text: str,
+    template: str,
+    previous_text: str = "",
+    next_text: str = "",
+    project_context: str = "",
+) -> str:
+    return build_groq_prompt(
+        segment_text=segment_text,
+        template=template,
+        previous_text=previous_text,
+        next_text=next_text,
+        project_context=project_context,
     )
-    return fallback_prompt
-
-
-def build_prompt(segment_text: str, template: str) -> str:
-    if prompt_provider() == "openrouter":
-        return build_openrouter_prompt(segment_text, template)
-    return build_rule_based_prompt(segment_text, template)
 
 
 def build_broll_prompt_entries(edit_plan: dict) -> list[PromptEntry]:
@@ -416,20 +294,23 @@ def build_broll_prompt_entries(edit_plan: dict) -> list[PromptEntry]:
     if not isinstance(segments, list):
         raise SystemExit("Malformed edit plan: missing 'segments' list.")
 
+    project_context = build_project_context(
+        [segment for segment in segments if isinstance(segment, dict)]
+    )
+    entries: list[PromptEntry] = []
     raw_entries = [
         raw_segment
         for raw_segment in segments
         if isinstance(raw_segment, dict) and raw_segment.get("broll_file")
     ]
-    if prompt_provider() == "openrouter" and raw_entries:
+    if raw_entries:
         print(
-            f"Generating {len(raw_entries)} B-roll prompts with OpenRouter...",
+            f"Generating {len(raw_entries)} B-roll prompts with Groq...",
             file=sys.stderr,
             flush=True,
         )
 
-    entries: list[PromptEntry] = []
-    for raw_segment in segments:
+    for raw_index, raw_segment in enumerate(segments):
         if not isinstance(raw_segment, dict):
             raise SystemExit("Malformed edit plan: each segment must be an object.")
 
@@ -438,20 +319,27 @@ def build_broll_prompt_entries(edit_plan: dict) -> list[PromptEntry]:
             continue
 
         template = str(raw_segment.get("template", ""))
-        segment_text = normalize_text(str(raw_segment.get("text", "")))
-        if prompt_provider() == "openrouter":
-            print(
-                f"Generating prompt for {broll_file}...",
-                file=sys.stderr,
-                flush=True,
-            )
+        segment_text = sanitize_context_text(str(raw_segment.get("text", "")))
+        previous_text = find_neighbor_text(segments, raw_index, -1)
+        next_text = find_neighbor_text(segments, raw_index, 1)
+        print(
+            f"Generating prompt for {broll_file}...",
+            file=sys.stderr,
+            flush=True,
+        )
         entries.append(
             PromptEntry(
                 segment_index=int(raw_segment.get("index", 0)),
                 template=template,
                 broll_file=str(broll_file),
                 segment_text=segment_text,
-                prompt=build_prompt(segment_text, template),
+                prompt=build_prompt(
+                    segment_text=segment_text,
+                    template=template,
+                    previous_text=previous_text,
+                    next_text=next_text,
+                    project_context=project_context,
+                ),
             )
         )
 

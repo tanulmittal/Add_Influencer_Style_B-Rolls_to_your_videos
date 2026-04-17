@@ -6,14 +6,19 @@ import functools
 import json
 import math
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
-from broll_prompts import generate_broll_prompts_for_project
+from broll_prompts import (
+    generate_broll_prompts_for_project,
+    get_groq_client,
+)
 
 WIDTH = 1080
 HEIGHT = 1920
@@ -28,45 +33,18 @@ SUBTITLE_LINE_SPACING = 8
 SUBTITLE_BOTTOM_MARGIN = int(HEIGHT * 0.2)
 SUBTITLE_BOX_FILL = (0, 0, 0, 191)
 SUBTITLE_TEXT_FILL = (255, 255, 255, 255)
+SUBTITLE_ACTIVE_TEXT_FILL = (255, 232, 115, 255)
 BROLL_START_ZOOM = 1.0
 BROLL_END_ZOOM = 1.1
 MIN_EDGE_DURATION = 1.0
 MAX_EDGE_DURATION = 3.0
 MIDDLE_BROLL_DURATION = 2.0
-PRODUCT_TERMS = {
-    "openai",
-    "chatgpt",
-    "codex",
-    "plus",
-    "pro",
-    "instant",
-    "thinking",
-    "model",
-    "models",
-    "tier",
-    "usage",
-}
-EXPLANATORY_PHRASES = (
-    "that gives you",
-    "built for",
-    "includes",
-    "still includes",
-    "access to",
-)
-MONTH_TERMS = (
-    "january",
-    "february",
-    "march",
-    "april",
-    "may",
-    "june",
-    "july",
-    "august",
-    "september",
-    "october",
-    "november",
-    "december",
-)
+GROQ_WORD_TRANSCRIPT_MODEL = "whisper-large-v3-turbo"
+WORD_TRANSCRIPT_LANGUAGE = "en"
+MIN_WORD_DURATION_SECONDS = 0.01
+WORD_BREAK_GAP_SECONDS = 0.45
+WORD_BREAK_MAX_WORDS = 7
+WORD_BREAK_MAX_CHARS = 36
 TEMPLATE_SEQUENCE = [
     "template_3",
     "template_1",
@@ -108,10 +86,21 @@ class Segment:
 
 
 @dataclass
+class WordToken:
+    word: str
+    start: float
+    end: float
+
+
+@dataclass
 class SubtitleCard:
     start: float
     end: float
     image_path: Path
+
+
+class GroqTranscriptionError(RuntimeError):
+    pass
 
 
 def run(cmd: list[str], cwd: Path | None = None) -> None:
@@ -219,6 +208,24 @@ def clean_caption_text(text: str) -> str:
     return re.sub(r"\[[^\]]+\]", "", text).strip()
 
 
+def normalize_word_text(text: str) -> str:
+    cleaned = clean_caption_text(text)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned.strip()
+
+
+def resolve_subtitle_model(subtitle_model: str | None) -> str:
+    return subtitle_model or GROQ_WORD_TRANSCRIPT_MODEL
+
+
+def format_srt_timestamp(seconds: float) -> str:
+    total_milliseconds = max(0, round(seconds * 1000))
+    hours, remainder = divmod(total_milliseconds, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    whole_seconds, milliseconds = divmod(remainder, 1000)
+    return f"{hours:02d}:{minutes:02d}:{whole_seconds:02d},{milliseconds:03d}"
+
+
 def slugify(text: str, fallback: str) -> str:
     cleaned = clean_caption_text(text).lower()
     cleaned = re.sub(r"[^a-z0-9]+", "_", cleaned).strip("_")
@@ -276,19 +283,6 @@ def build_segment_boundaries(video_duration: float) -> list[float]:
 
     shot_count = max(2, round(video_duration / 4))
     return [round(video_duration * index / shot_count, 3) for index in range(shot_count + 1)]
-
-
-def choose_middle_template(text: str) -> str:
-    lower = text.lower()
-    score = 0
-    if re.search(r"(\$|₹|€|\d)", text):
-        score += 2
-    if any(month in lower for month in MONTH_TERMS):
-        score += 2
-    score += min(2, sum(1 for term in PRODUCT_TERMS if term in lower))
-    if any(phrase in lower for phrase in EXPLANATORY_PHRASES):
-        score -= 1
-    return "template_3" if score >= 3 else "template_2"
 
 
 def assign_templates(segments: list[Segment]) -> None:
@@ -415,9 +409,6 @@ def create_placeholder_image_with_pillow(
 def create_placeholder_images(broll_dir: Path, segments: list[Segment], overwrite: bool) -> None:
     broll_dir.mkdir(parents=True, exist_ok=True)
     font_path = pick_placeholder_font()
-    can_drawtext = bool(font_path) and ffmpeg_has_filter("drawtext")
-    label_dir = broll_dir / ".label_cache"
-    label_dir.mkdir(exist_ok=True)
     for segment in segments:
         if not segment.broll_file:
             continue
@@ -429,51 +420,25 @@ def create_placeholder_images(broll_dir: Path, segments: list[Segment], overwrit
             output_path.stem.replace("_", " ").upper(),
             max_chars=max_chars,
         )
-        label_path = label_dir / f"{output_path.stem}.txt"
-        label_path.write_text(label, encoding="utf-8")
         placeholder_width, placeholder_height = broll_dimensions_for_template(segment.template)
-        if not can_drawtext:
-            create_placeholder_image_with_pillow(
-                output_path=output_path,
-                label=label,
-                font_path=font_path,
-                font_size=font_size,
-                width=placeholder_width,
-                height=placeholder_height,
-            )
-            continue
-        drawtext = (
-            "drawtext="
-            f"fontfile='{font_path}':"
-            f"textfile='{label_path}':"
-            "fontcolor=white:"
-            f"fontsize={font_size}:"
-            "x=(w-text_w)/2:"
-            "y=(h-text_h)/2:"
-            "line_spacing=12"
-        ) if can_drawtext else None
-        vf = [drawtext] if drawtext else []
-        run(
-            [
-                "ffmpeg",
-                "-y",
-                "-f",
-                "lavfi",
-                "-i",
-                f"color=c=#111827:s={placeholder_width}x{placeholder_height}",
-                "-frames:v",
-                "1",
-                "-update",
-                "1",
-                *([ "-vf", ",".join(vf) ] if vf else []),
-                str(output_path),
-            ]
+        create_placeholder_image_with_pillow(
+            output_path=output_path,
+            label=label,
+            font_path=font_path,
+            font_size=font_size,
+            width=placeholder_width,
+            height=placeholder_height,
         )
 
 
 def measure_text_width(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont) -> int:
     left, _, right, _ = draw.textbbox((0, 0), text, font=font)
     return right - left
+
+
+def measure_text_height(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont) -> int:
+    _, top, _, bottom = draw.textbbox((0, 0), text, font=font)
+    return bottom - top
 
 
 def wrap_text_to_pixel_width(
@@ -538,12 +503,87 @@ def render_subtitle_card(
     image.save(output_path)
 
 
-def build_subtitle_cards(output_dir: Path, cues: list[Cue]) -> list[SubtitleCard]:
-    subtitle_dir = output_dir / "subtitle_cards"
-    subtitle_dir.mkdir(parents=True, exist_ok=True)
-    for existing_file in subtitle_dir.glob("*.png"):
-        existing_file.unlink()
+def wrap_words_to_lines(
+    words: list[str],
+    draw: ImageDraw.ImageDraw,
+    font: ImageFont.FreeTypeFont,
+    max_width: int,
+) -> list[list[tuple[int, str]]]:
+    if not words:
+        return []
 
+    space_width = measure_text_width(draw, " ", font)
+    lines: list[list[tuple[int, str]]] = []
+    current: list[tuple[int, str]] = []
+    current_width = 0
+    for index, word in enumerate(words):
+        word_width = measure_text_width(draw, word, font)
+        projected = word_width if not current else current_width + space_width + word_width
+        if current and projected > max_width:
+            lines.append(current)
+            current = [(index, word)]
+            current_width = word_width
+            continue
+        current.append((index, word))
+        current_width = projected
+    if current:
+        lines.append(current)
+    return lines
+
+
+def render_highlighted_subtitle_card(
+    output_path: Path,
+    words: list[str],
+    active_index: int,
+    font_path: str,
+) -> None:
+    scratch = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(scratch)
+    font = ImageFont.truetype(font_path, SUBTITLE_FONT_SIZE)
+    wrapped_lines = wrap_words_to_lines(words, draw, font, SUBTITLE_TEXT_MAX_WIDTH)
+    if not wrapped_lines:
+        raise SystemExit("Cannot render subtitle card with no words.")
+
+    space_width = measure_text_width(draw, " ", font)
+    line_height = measure_text_height(draw, "Ag", font)
+    line_widths: list[int] = []
+    for line in wrapped_lines:
+        width = 0
+        for position, (_, word) in enumerate(line):
+            width += measure_text_width(draw, word, font)
+            if position < len(line) - 1:
+                width += space_width
+        line_widths.append(width)
+
+    image_width = math.ceil(max(line_widths) + SUBTITLE_PADDING_X * 2)
+    image_height = math.ceil(
+        line_height * len(wrapped_lines)
+        + SUBTITLE_LINE_SPACING * max(0, len(wrapped_lines) - 1)
+        + SUBTITLE_PADDING_Y * 2
+    )
+
+    image = Image.new("RGBA", (image_width, image_height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle(
+        (0, 0, image_width - 1, image_height - 1),
+        radius=SUBTITLE_CORNER_RADIUS,
+        fill=SUBTITLE_BOX_FILL,
+    )
+    y = SUBTITLE_PADDING_Y
+    for line, line_width in zip(wrapped_lines, line_widths):
+        x = (image_width - line_width) / 2
+        for position, (word_index, word) in enumerate(line):
+            fill = SUBTITLE_ACTIVE_TEXT_FILL if word_index == active_index else SUBTITLE_TEXT_FILL
+            draw.text((x, y), word, font=font, fill=fill)
+            x += measure_text_width(draw, word, font)
+            if position < len(line) - 1:
+                x += space_width
+        y += line_height + SUBTITLE_LINE_SPACING
+    image.save(output_path)
+
+
+def build_cue_subtitle_cards(subtitle_dir: Path, cues: list[Cue]) -> list[SubtitleCard]:
+    subtitle_dir.mkdir(parents=True, exist_ok=True)
     font_path = pick_inter_font()
     subtitle_cards: list[SubtitleCard] = []
     for cue in cues:
@@ -560,6 +600,464 @@ def build_subtitle_cards(output_dir: Path, cues: list[Cue]) -> list[SubtitleCard
             )
         )
     return subtitle_cards
+
+
+def should_refresh_transcript_cache(
+    cache_path: Path,
+    source_path: Path,
+    backend: str,
+    model_name: str,
+    language: str,
+) -> bool:
+    if not cache_path.is_file():
+        return True
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return True
+
+    tokens = payload.get("tokens")
+    if not isinstance(tokens, list) or not tokens:
+        return True
+    if payload.get("backend") != backend:
+        return True
+    if payload.get("model") != model_name or payload.get("language") != language:
+        return True
+    return int(payload.get("source_mtime_ns", -1)) != source_path.stat().st_mtime_ns
+
+
+def normalize_word_tokens(raw_tokens: object, source_name: str) -> list[WordToken]:
+    if not isinstance(raw_tokens, list):
+        raise ValueError(f"{source_name} is missing a tokens list.")
+
+    tokens: list[WordToken] = []
+    previous_end = -1.0
+    for raw_token in raw_tokens:
+        if not isinstance(raw_token, dict):
+            raise ValueError(f"{source_name} contains a non-object token.")
+        word = normalize_word_text(str(raw_token.get("word", "")))
+        start = raw_token.get("start")
+        end = raw_token.get("end")
+        if not word:
+            raise ValueError(f"{source_name} contains an empty word token.")
+        if not isinstance(start, (int, float)) or not isinstance(end, (int, float)):
+            raise ValueError(f"{source_name} contains a token with non-numeric timing.")
+        start_value = round(float(start), 3)
+        end_value = round(float(end), 3)
+        if end_value <= start_value:
+            raise ValueError(f"{source_name} contains a token with non-positive duration.")
+        if tokens and (start_value < previous_end or end_value < previous_end):
+            raise ValueError(f"{source_name} contains non-monotonic word timings.")
+        tokens.append(WordToken(word=word, start=start_value, end=end_value))
+        previous_end = end_value
+    if not tokens:
+        raise ValueError(f"{source_name} did not contain any word tokens.")
+    return tokens
+
+
+def load_cached_word_tokens(cache_path: Path) -> list[WordToken]:
+    payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    try:
+        return normalize_word_tokens(payload.get("tokens"), f"transcript cache {cache_path}")
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+
+def save_word_tokens_cache(
+    cache_path: Path,
+    source_path: Path,
+    backend: str,
+    model_name: str,
+    language: str,
+    tokens: list[WordToken],
+) -> None:
+    payload = {
+        "source_video": source_path.name,
+        "source_mtime_ns": source_path.stat().st_mtime_ns,
+        "backend": backend,
+        "model": model_name,
+        "language": language,
+        "tokens": [asdict(token) for token in tokens],
+    }
+    cache_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def extract_transcription_audio(video_path: Path, audio_path: Path) -> None:
+    run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(video_path),
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
+            "pcm_s16le",
+            str(audio_path),
+        ]
+    )
+
+
+def coerce_transcription_words(raw_words: object) -> list[dict[str, object]]:
+    if not isinstance(raw_words, list):
+        raise GroqTranscriptionError("Groq transcription response did not include word timestamps.")
+
+    coerced_words: list[dict[str, object]] = []
+    for raw_word in raw_words:
+        if hasattr(raw_word, "model_dump"):
+            payload = raw_word.model_dump()
+        elif isinstance(raw_word, dict):
+            payload = raw_word
+        else:
+            payload = {
+                "word": getattr(raw_word, "word", None),
+                "start": getattr(raw_word, "start", None),
+                "end": getattr(raw_word, "end", None),
+            }
+        coerced_words.append(payload)
+    return coerced_words
+
+
+def repair_groq_word_timings(raw_words: list[dict[str, object]]) -> list[dict[str, object]]:
+    repaired_words: list[dict[str, object]] = []
+    previous_end = -1.0
+    for raw_word in raw_words:
+        payload = dict(raw_word)
+        start = payload.get("start")
+        end = payload.get("end")
+        if isinstance(start, (int, float)) and isinstance(end, (int, float)):
+            start_value = round(float(start), 3)
+            end_value = round(float(end), 3)
+            if previous_end >= 0:
+                start_value = max(start_value, previous_end)
+            if end_value <= start_value:
+                end_value = round(start_value + MIN_WORD_DURATION_SECONDS, 3)
+            payload["start"] = start_value
+            payload["end"] = end_value
+            previous_end = end_value
+        repaired_words.append(payload)
+    return repaired_words
+
+
+def coerce_transcription_segments(raw_segments: object) -> list[dict[str, object]]:
+    if not isinstance(raw_segments, list):
+        return []
+
+    coerced_segments: list[dict[str, object]] = []
+    for raw_segment in raw_segments:
+        if hasattr(raw_segment, "model_dump"):
+            payload = raw_segment.model_dump()
+        elif isinstance(raw_segment, dict):
+            payload = raw_segment
+        else:
+            payload = {
+                "text": getattr(raw_segment, "text", None),
+                "start": getattr(raw_segment, "start", None),
+                "end": getattr(raw_segment, "end", None),
+            }
+        coerced_segments.append(payload)
+    return coerced_segments
+
+
+def normalize_segment_cues(raw_segments: object, source_name: str) -> list[Cue]:
+    if not isinstance(raw_segments, list):
+        raise ValueError(f"{source_name} is missing a segments list.")
+
+    cues: list[Cue] = []
+    previous_end = -1.0
+    for index, raw_segment in enumerate(raw_segments, start=1):
+        if not isinstance(raw_segment, dict):
+            raise ValueError(f"{source_name} contains a non-object segment.")
+        text = normalize_word_text(str(raw_segment.get("text", "")))
+        start = raw_segment.get("start")
+        end = raw_segment.get("end")
+        if not text:
+            continue
+        if not isinstance(start, (int, float)) or not isinstance(end, (int, float)):
+            raise ValueError(f"{source_name} contains a segment with non-numeric timing.")
+        start_value = round(float(start), 3)
+        end_value = round(float(end), 3)
+        if cues:
+            start_value = max(start_value, previous_end)
+        if end_value <= start_value:
+            end_value = round(start_value + MIN_WORD_DURATION_SECONDS, 3)
+        cues.append(Cue(index=index, start=start_value, end=end_value, text=text))
+        previous_end = end_value
+    if not cues:
+        raise ValueError(f"{source_name} did not contain any transcript segments.")
+    return cues
+
+
+def build_phrase_cues(tokens: list[WordToken]) -> list[Cue]:
+    cues: list[Cue] = []
+    for index, phrase in enumerate(group_word_phrases(tokens), start=1):
+        cues.append(
+            Cue(
+                index=index,
+                start=round(phrase[0].start, 3),
+                end=round(phrase[-1].end, 3),
+                text=" ".join(token.word for token in phrase),
+            )
+        )
+    return cues
+
+
+def parse_groq_transcript_response(transcription: object) -> tuple[str, list[WordToken], list[Cue]]:
+    if hasattr(transcription, "model_dump"):
+        payload = transcription.model_dump()
+    elif isinstance(transcription, dict):
+        payload = transcription
+    else:
+        payload = {}
+
+    language = str(payload.get("language") or getattr(transcription, "language", "") or "").strip()
+    if not language:
+        language = WORD_TRANSCRIPT_LANGUAGE
+
+    raw_words = payload.get("words")
+    if raw_words is None:
+        raw_words = getattr(transcription, "words", None)
+    try:
+        tokens = normalize_word_tokens(
+            repair_groq_word_timings(coerce_transcription_words(raw_words)),
+            "Groq transcription response",
+        )
+    except ValueError as exc:
+        raise GroqTranscriptionError(str(exc)) from exc
+    raw_segments = payload.get("segments")
+    if raw_segments is None:
+        raw_segments = getattr(transcription, "segments", None)
+    try:
+        cues = normalize_segment_cues(
+            coerce_transcription_segments(raw_segments),
+            "Groq transcription response",
+        )
+    except ValueError:
+        cues = build_phrase_cues(tokens)
+    return language, tokens, cues
+
+
+def write_transcript_srt(transcript_path: Path, cues: list[Cue]) -> None:
+    blocks = [
+        "\n".join(
+            [
+                str(cue.index),
+                f"{format_srt_timestamp(cue.start)} --> {format_srt_timestamp(cue.end)}",
+                cue.text,
+            ]
+        )
+        for cue in cues
+    ]
+    transcript_path.write_text("\n\n".join(blocks) + "\n", encoding="utf-8")
+
+
+def generate_transcript_artifacts(
+    video_path: Path,
+    output_dir: Path,
+    model_name: str,
+    language: str,
+) -> tuple[str, list[WordToken], list[Cue]]:
+    audio_path = output_dir / ".transcription_audio.wav"
+    extract_transcription_audio(video_path, audio_path)
+    try:
+        client = get_groq_client()
+        with audio_path.open("rb") as audio_file:
+            try:
+                transcription = client.audio.transcriptions.create(
+                    file=(audio_path.name, audio_file.read()),
+                    model=model_name,
+                    temperature=0,
+                    response_format="verbose_json",
+                    timestamp_granularities=["word", "segment"],
+                    language=language,
+                )
+            except Exception as exc:
+                raise GroqTranscriptionError("Groq transcription request failed.") from exc
+        return parse_groq_transcript_response(transcription)
+    finally:
+        if audio_path.exists():
+            audio_path.unlink()
+
+
+def transcribe_word_tokens(
+    video_path: Path,
+    output_dir: Path,
+    model_name: str,
+    language: str,
+    refresh: bool,
+) -> list[WordToken]:
+    cache_path = output_dir / "word_timestamps.json"
+    if not refresh and not should_refresh_transcript_cache(
+        cache_path,
+        video_path,
+        "groq",
+        model_name,
+        language,
+    ):
+        return load_cached_word_tokens(cache_path)
+
+    detected_language, tokens, _ = generate_transcript_artifacts(
+        video_path=video_path,
+        output_dir=output_dir,
+        model_name=model_name,
+        language=language,
+    )
+
+    save_word_tokens_cache(
+        cache_path,
+        video_path,
+        "groq",
+        model_name,
+        detected_language or language,
+        tokens,
+    )
+    return tokens
+
+
+def ensure_project_transcript(
+    video_path: Path,
+    output_dir: Path,
+    model_name: str,
+    language: str,
+    refresh: bool,
+) -> list[Cue]:
+    cache_path = output_dir / "word_timestamps.json"
+    transcript_path = output_dir / "transcript.srt"
+    if (
+        not refresh
+        and transcript_path.is_file()
+        and not should_refresh_transcript_cache(
+            cache_path,
+            video_path,
+            "groq",
+            model_name,
+            language,
+        )
+    ):
+        return parse_srt(transcript_path)
+
+    detected_language, tokens, cues = generate_transcript_artifacts(
+        video_path=video_path,
+        output_dir=output_dir,
+        model_name=model_name,
+        language=language,
+    )
+    save_word_tokens_cache(
+        cache_path,
+        video_path,
+        "groq",
+        model_name,
+        detected_language or language,
+        tokens,
+    )
+    write_transcript_srt(transcript_path, cues)
+    return cues
+
+
+def should_break_word_phrase(current_tokens: list[WordToken], next_token: WordToken) -> bool:
+    if not current_tokens:
+        return False
+    previous = current_tokens[-1]
+    if next_token.start - previous.end >= WORD_BREAK_GAP_SECONDS:
+        return True
+    if len(current_tokens) >= WORD_BREAK_MAX_WORDS:
+        return True
+    projected_text = " ".join(token.word for token in [*current_tokens, next_token])
+    if len(projected_text) > WORD_BREAK_MAX_CHARS:
+        return True
+    if re.search(r"[.!?,:;]$", previous.word):
+        return True
+    return False
+
+
+def group_word_phrases(tokens: list[WordToken]) -> list[list[WordToken]]:
+    phrases: list[list[WordToken]] = []
+    current: list[WordToken] = []
+    for token in tokens:
+        if should_break_word_phrase(current, token):
+            phrases.append(current)
+            current = [token]
+            continue
+        current.append(token)
+    if current:
+        phrases.append(current)
+    return phrases
+
+
+def build_word_subtitle_cards(
+    output_dir: Path,
+    subtitle_dir: Path,
+    video_path: Path,
+    model_name: str,
+    language: str,
+    refresh: bool,
+) -> list[SubtitleCard]:
+    subtitle_dir.mkdir(parents=True, exist_ok=True)
+
+    tokens = transcribe_word_tokens(
+        video_path=video_path,
+        output_dir=output_dir,
+        model_name=model_name,
+        language=language,
+        refresh=refresh,
+    )
+    font_path = pick_inter_font()
+    subtitle_cards: list[SubtitleCard] = []
+    card_index = 1
+    for phrase in group_word_phrases(tokens):
+        phrase_words = [token.word for token in phrase]
+        for word_index, token in enumerate(phrase):
+            frame_end = phrase[word_index + 1].start if word_index + 1 < len(phrase) else token.end
+            if frame_end <= token.start:
+                frame_end = max(token.end, token.start + 0.05)
+            image_path = subtitle_dir / f"word_{card_index:04d}.png"
+            render_highlighted_subtitle_card(
+                image_path,
+                phrase_words,
+                word_index,
+                font_path,
+            )
+            subtitle_cards.append(
+                SubtitleCard(
+                    start=round(token.start, 3),
+                    end=round(frame_end, 3),
+                    image_path=image_path,
+                )
+            )
+            card_index += 1
+    return subtitle_cards
+
+
+def build_subtitle_cards(
+    output_dir: Path,
+    subtitle_dir: Path,
+    video_path: Path,
+    cues: list[Cue],
+    subtitle_mode: str,
+    subtitle_model: str,
+    subtitle_language: str,
+    refresh_transcript: bool,
+) -> list[SubtitleCard]:
+    if subtitle_mode == "cue":
+        return build_cue_subtitle_cards(subtitle_dir, cues)
+    try:
+        return build_word_subtitle_cards(
+            output_dir=output_dir,
+            subtitle_dir=subtitle_dir,
+            video_path=video_path,
+            model_name=subtitle_model,
+            language=subtitle_language,
+            refresh=refresh_transcript,
+        )
+    except GroqTranscriptionError as exc:
+        print(
+            f"Groq word transcription failed ({exc}). Falling back to cue-timed subtitles.",
+            file=sys.stderr,
+        )
+        return build_cue_subtitle_cards(subtitle_dir, cues)
 
 
 def broll_dimensions_for_template(template: str) -> tuple[int, int]:
@@ -604,18 +1102,39 @@ def remove_unused_broll_files(broll_dir: Path, segments: list[Segment]) -> None:
         return
     expected_files = {segment.broll_file for segment in segments if segment.broll_file}
     for path in broll_dir.iterdir():
-        if path.is_file() and path.name not in expected_files:
+        if path.is_dir() and path.name.startswith("."):
+            shutil.rmtree(path)
+        elif path.is_file() and path.name not in expected_files:
             path.unlink()
 
 
-def write_edit_plan(output_path: Path, video_path: Path, srt_path: Path, segments: list[Segment]) -> None:
+def write_edit_plan(
+    output_path: Path,
+    video_path: Path,
+    transcript_path: Path,
+    segments: list[Segment],
+) -> None:
     payload = {
         "video": video_path.name,
-        "srt": srt_path.name,
+        "transcript": transcript_path.name,
         "formula": "template_1 + repeated relevant templates + template_1",
         "segments": [asdict(segment) for segment in segments],
     }
     output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def prepare_broll_dir(folder: Path, create: bool) -> Path:
+    canonical_dir = folder / "broll"
+    legacy_dir = folder / "B_roll"
+    if canonical_dir.exists() and legacy_dir.exists():
+        raise SystemExit(
+            f"Both {canonical_dir.name}/ and {legacy_dir.name}/ exist in {folder}. Remove one layout and rerun."
+        )
+    if legacy_dir.exists():
+        legacy_dir.rename(canonical_dir)
+    if create:
+        canonical_dir.mkdir(parents=True, exist_ok=True)
+    return canonical_dir
 
 
 def load_segments_from_edit_plan(edit_plan_path: Path) -> list[Segment]:
@@ -766,16 +1285,13 @@ def build_filter_complex(
 
 
 def render_video(
-    folder: Path,
     video_path: Path,
-    srt_path: Path,
     output_dir: Path,
     broll_dir: Path,
     segments: list[Segment],
-    cues: list[Cue],
+    subtitle_cards: list[SubtitleCard],
     fps: int,
     include_audio: bool,
-    burn_subtitles: bool,
 ) -> Path:
     image_segments = [segment for segment in segments if segment.broll_file]
     image_inputs: dict[str, int] = {}
@@ -784,19 +1300,16 @@ def render_video(
         image_inputs[segment.broll_file] = position
         command.extend(["-loop", "1", "-i", str(broll_dir / segment.broll_file)])
 
-    subtitle_cards: list[SubtitleCard] = []
-    if burn_subtitles:
-        subtitle_cards = build_subtitle_cards(output_dir, cues)
-        for card in subtitle_cards:
-            image_inputs[str(card.image_path)] = len(image_inputs) + 1
-            command.extend(["-loop", "1", "-i", str(card.image_path)])
+    for card in subtitle_cards:
+        image_inputs[str(card.image_path)] = len(image_inputs) + 1
+        command.extend(["-loop", "1", "-i", str(card.image_path)])
 
     filter_complex, video_label, audio_label = build_filter_complex(
         segments=segments,
         include_audio=include_audio,
         image_inputs=image_inputs,
         subtitle_cards=subtitle_cards,
-        burn_subtitles=burn_subtitles,
+        burn_subtitles=bool(subtitle_cards),
         fps=fps,
     )
     output_path = output_dir / "final_edit.mp4"
@@ -833,13 +1346,13 @@ def render_video(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Build a 9:16 A-roll/B-roll edit from a single video and SRT file."
+        description="Build a 9:16 A-roll/B-roll edit from a single source video."
     )
     parser.add_argument(
         "folder",
         nargs="?",
         default=".",
-        help="Folder containing exactly one .mp4 and one .srt file.",
+        help="Folder containing exactly one source video.",
     )
     parser.add_argument(
         "--overwrite-placeholders",
@@ -858,6 +1371,27 @@ def main() -> int:
         action="store_false",
         help="Render without burned-in subtitles.",
     )
+    parser.add_argument(
+        "--subtitle-mode",
+        choices=("word", "cue"),
+        default="word",
+        help="Burn subtitles using word-level timing or the original cue-level SRT timing.",
+    )
+    parser.add_argument(
+        "--subtitle-model",
+        default=None,
+        help=f"Groq transcription model to use for word-level subtitles (default: {GROQ_WORD_TRANSCRIPT_MODEL}).",
+    )
+    parser.add_argument(
+        "--subtitle-language",
+        default=WORD_TRANSCRIPT_LANGUAGE,
+        help=f"Language code for word-level transcription (default: {WORD_TRANSCRIPT_LANGUAGE}).",
+    )
+    parser.add_argument(
+        "--refresh-transcript",
+        action="store_true",
+        help="Ignore cached word timestamps and transcribe the source video again.",
+    )
     parser.set_defaults(burn_subtitles=True)
     args = parser.parse_args()
 
@@ -866,15 +1400,21 @@ def main() -> int:
         raise SystemExit(f"{folder} is not a folder.")
 
     video_path = discover_single_file(folder, (".mp4", ".mov", ".m4v"))
-    srt_path = discover_single_file(folder, (".srt",))
+    output_dir = folder / "output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    subtitle_model = resolve_subtitle_model(args.subtitle_model)
+    cues = ensure_project_transcript(
+        video_path=video_path,
+        output_dir=output_dir,
+        model_name=subtitle_model,
+        language=args.subtitle_language,
+        refresh=args.refresh_transcript,
+    )
     duration, fps = probe_video(video_path)
-    cues = parse_srt(srt_path)
     segments = build_segments(cues, duration)
     assign_templates(segments)
 
-    broll_dir = folder / "B_roll"
-    output_dir = folder / "output"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    broll_dir = prepare_broll_dir(folder, create=True)
 
     create_placeholder_images(
         broll_dir=broll_dir,
@@ -882,20 +1422,31 @@ def main() -> int:
         overwrite=args.overwrite_placeholders,
     )
     remove_unused_broll_files(broll_dir, segments)
-    write_edit_plan(output_dir / "edit_plan.json", video_path, srt_path, segments)
+    transcript_path = output_dir / "transcript.srt"
+    write_edit_plan(output_dir / "edit_plan.json", video_path, transcript_path, segments)
     generate_broll_prompts_for_project(folder)
-    output_path = render_video(
-        folder=folder,
-        video_path=video_path,
-        srt_path=srt_path,
-        output_dir=output_dir,
-        broll_dir=broll_dir,
-        segments=segments,
-        cues=cues,
-        fps=fps,
-        include_audio=has_audio_stream(video_path),
-        burn_subtitles=args.burn_subtitles,
-    )
+    with tempfile.TemporaryDirectory(prefix=".subtitle_cards_", dir=output_dir) as subtitle_dir:
+        subtitle_cards: list[SubtitleCard] = []
+        if args.burn_subtitles:
+            subtitle_cards = build_subtitle_cards(
+                output_dir=output_dir,
+                subtitle_dir=Path(subtitle_dir),
+                video_path=video_path,
+                cues=cues,
+                subtitle_mode=args.subtitle_mode,
+                subtitle_model=subtitle_model,
+                subtitle_language=args.subtitle_language,
+                refresh_transcript=args.refresh_transcript,
+            )
+        output_path = render_video(
+            video_path=video_path,
+            output_dir=output_dir,
+            broll_dir=broll_dir,
+            segments=segments,
+            subtitle_cards=subtitle_cards,
+            fps=fps,
+            include_audio=has_audio_stream(video_path),
+        )
     print(f"Rendered {output_path}")
     return 0
 

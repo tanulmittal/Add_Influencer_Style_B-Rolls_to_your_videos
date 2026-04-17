@@ -1,6 +1,6 @@
-# Add Influencer Style B-Rolls to your videos
+# Add Influencer Style B-Rolls to Your Videos
 
-Add Influencer Style - B-Rolls to your videos (current support 9:16 videos)
+Create a 9:16 talking-head edit from a single source video. The tool:
 
 ## Preview
 
@@ -12,44 +12,25 @@ Add Influencer Style - B-Rolls to your videos (current support 9:16 videos)
 
 ![After edit](assets/readme/after.gif)
 
-Create an edited video using:
+- transcribes the video with Groq
+- generates `output/transcript.srt`
+- builds an edit plan and B-roll prompts
+- creates placeholder B-roll images in `broll/`
+- renders `output/final_edit.mp4`
 
-- `video.mp4`
-- `audio.srt`
+## Requirements
 
-## Simple Flow
+- Python 3.10+
+- `ffmpeg` available on your `PATH`
+- A Groq API key
 
-1. Create a project folder inside this repo.
-2. Add these files inside that folder:
-
-```text
-your-project/
-├── video.mp4
-└── audio.srt
-```
-
-3. Run:
+Install Python dependencies:
 
 ```bash
-python3 create.py your-project
+pip install -r requirements.txt
 ```
 
-Subtitles are burned into the output by default using the project SRT timing.
-
-- Font: `Inter`
-- Size: `37px`
-- Style: white text with a black `75%` opacity rounded background box
-- Placement: bottom-center in the lower safe area
-
-To skip subtitles for a render, use:
-
-```bash
-python3 create.py your-project --no-subs
-```
-
-## OpenRouter Setup
-
-To generate AI B-roll prompts, add your OpenRouter key in `.env`.
+Set up Groq:
 
 ```bash
 cp .env.example .env
@@ -58,35 +39,91 @@ cp .env.example .env
 Then update `.env`:
 
 ```env
-OPENROUTER_API_KEY=your_openrouter_api_key
+GROQ_API_KEY=your_groq_api_key
+GROQ_PROMPT_MODEL=openai/gpt-oss-20b
 ```
 
-## B-roll Replacement Flow
+## Project Layout
 
-After running `create.py`, the tool generates temp B-roll images and prompts for you.
-
-Go to the generated folder:
+Create a project folder containing exactly one source video:
 
 ```text
 your-project/
-├── B_roll/
-└── output/
+└── video.mp4
 ```
 
-Replace the generated temporary images inside `B_roll/` with your own image B-rolls, then run:
+After `create.py` runs, the folder will look like this:
+
+```text
+your-project/
+├── video.mp4
+├── broll/
+│   ├── 001_*.png
+│   └── ...
+└── output/
+    ├── transcript.srt
+    ├── word_timestamps.json
+    ├── edit_plan.json
+    ├── broll_prompts.md
+    └── final_edit.mp4
+```
+
+## Main Flow
+
+Run the initial build:
+
+```bash
+python3 create.py your-project
+```
+
+What gets generated:
+
+- `output/transcript.srt`: transcript used as the source of truth for segment text
+- `output/word_timestamps.json`: Groq word timings used for subtitle sync
+- `output/edit_plan.json`: segment timing and template plan
+- `output/broll_prompts.md`: image prompts for each B-roll slot
+- `broll/*.png`: placeholder images you can replace
+- `output/final_edit.mp4`: rendered result
+
+## Replace B-Roll And Rerender
+
+Replace the placeholder images inside `broll/` with your own images, then rerender:
 
 ```bash
 python3 recreate.py your-project
 ```
 
-To rerender without subtitles:
+The rerender uses the existing:
+
+- `output/transcript.srt`
+- `output/edit_plan.json`
+- current files in `broll/`
+
+## Subtitle Behavior
+
+Burned subtitles are enabled by default.
+
+- Default mode: `--subtitle-mode word`
+- Fallback mode: `--subtitle-mode cue`
+
+Word subtitles use Groq `whisper-large-v3-turbo` timings and highlight the currently spoken word inside a bottom-centered black rounded box.
+
+If Groq returns unusable word timings, rendering falls back to cue-timed subtitles from `output/transcript.srt`.
+
+Useful commands:
 
 ```bash
-python3 recreate.py your-project --no-subs
+python3 create.py your-project --no-subs
+python3 create.py your-project --subtitle-mode cue
+python3 recreate.py your-project --refresh-transcript
 ```
 
-Your influencer explainer video will be ready in:
+## Runtime Files
 
-```text
-your-project/output/final_edit.mp4
-```
+The shipped Python files are:
+
+- `create.py`
+- `recreate.py`
+- `broll_prompts.py`
+
+
