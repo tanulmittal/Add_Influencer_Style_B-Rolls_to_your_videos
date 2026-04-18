@@ -60,7 +60,7 @@ After `create.py` runs, the folder will look like this:
 your-project/
 ├── video.mp4
 ├── broll/
-│   ├── 001_*.png
+│   ├── 02_*.png
 │   └── ...
 └── output/
     ├── transcript.srt
@@ -114,6 +114,15 @@ Burned subtitles are enabled by default.
 Word subtitles use Groq `whisper-large-v3-turbo` timings and highlight the currently spoken word inside a bottom-centered black rounded box.
 
 If `output/word_timestamps.json` is missing, stale, or invalid, the renderer automatically retranscribes the source video to rebuild the cache. If Groq still returns unusable word timings, rendering falls back to cue-timed subtitles from `output/transcript.srt`.
+
+### Editing Subtitle Text
+
+If you want to fix subtitle text manually before rerendering:
+
+- Edit `output/transcript.srt` if you want to change the cue text and the rebuilt segment text in `output/edit_plan.json`.
+- Use `python3 recreate.py your-project --subtitle-mode cue` if you want the rendered subtitles to match the edited SRT text exactly.
+- If you rerender in the default `--subtitle-mode word`, the on-screen subtitle cards are built from `output/word_timestamps.json`, not from `output/transcript.srt`.
+- In word mode, edit `output/word_timestamps.json` too if you need the burned subtitle text itself to reflect manual typo fixes.
 
 Useful commands:
 
