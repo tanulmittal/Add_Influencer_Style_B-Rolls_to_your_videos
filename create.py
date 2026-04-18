@@ -45,6 +45,7 @@ MIN_WORD_DURATION_SECONDS = 0.01
 WORD_BREAK_GAP_SECONDS = 0.45
 WORD_BREAK_MAX_WORDS = 7
 WORD_BREAK_MAX_CHARS = 36
+OPENING_THUMBNAIL_FILE = "thumbnail.png"
 TEMPLATE_SEQUENCE = [
     "template_3",
     "template_1",
@@ -417,6 +418,18 @@ def create_placeholder_image_with_pillow(
 def create_placeholder_images(broll_dir: Path, segments: list[Segment], overwrite: bool) -> None:
     broll_dir.mkdir(parents=True, exist_ok=True)
     font_path = pick_placeholder_font()
+
+    thumbnail_path = broll_dir / OPENING_THUMBNAIL_FILE
+    if overwrite or not thumbnail_path.exists():
+        create_placeholder_image_with_pillow(
+            output_path=thumbnail_path,
+            label="THUMBNAIL",
+            font_path=font_path,
+            font_size=36,
+            width=WIDTH,
+            height=HEIGHT,
+        )
+
     for segment in segments:
         if not segment.broll_file:
             continue
@@ -1119,6 +1132,7 @@ def remove_unused_broll_files(broll_dir: Path, segments: list[Segment]) -> None:
     if not broll_dir.exists():
         return
     expected_files = {segment.broll_file for segment in segments if segment.broll_file}
+    expected_files.add(OPENING_THUMBNAIL_FILE)
     for path in broll_dir.iterdir():
         if path.is_dir() and path.name.startswith("."):
             shutil.rmtree(path)
@@ -1256,6 +1270,28 @@ def load_segments_from_edit_plan(edit_plan_path: Path) -> list[Segment]:
     return segments
 
 
+def find_opening_thumbnail_broll_file(broll_dir: Path) -> str | None:
+    thumbnail_path = broll_dir / OPENING_THUMBNAIL_FILE
+    if thumbnail_path.is_file():
+        return OPENING_THUMBNAIL_FILE
+    return None
+
+
+def build_opening_thumbnail_filter(
+    input_label: str,
+    output_label: str,
+    frame_duration: float,
+) -> str:
+    return (
+        f"{input_label}trim=duration={frame_duration:.6f},"
+        "setpts=PTS-STARTPTS,"
+        f"scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=decrease,"
+        f"pad={WIDTH}:{HEIGHT}:(ow-iw)/2:(oh-ih)/2:black,"
+        "setsar=1"
+        f"[{output_label}]"
+    )
+
+
 def build_filter_complex(
     segments: list[Segment],
     include_audio: bool,
@@ -1263,9 +1299,36 @@ def build_filter_complex(
     subtitle_cards: list[SubtitleCard],
     burn_subtitles: bool,
     fps: int,
+    opening_thumbnail_broll_file: str | None,
 ) -> tuple[str, str, str]:
     filters: list[str] = []
     concat_parts: list[str] = []
+    frame_duration = 1 / fps
+    subtitle_offset = frame_duration
+
+    if opening_thumbnail_broll_file and opening_thumbnail_broll_file in image_inputs:
+        opening_input_index = image_inputs[opening_thumbnail_broll_file]
+        filters.append(
+            build_opening_thumbnail_filter(
+                input_label=f"[{opening_input_index}:v]",
+                output_label="thumb_v",
+                frame_duration=frame_duration,
+            )
+        )
+    else:
+        filters.append(
+            f"[0:v]trim=start=0:end={frame_duration:.6f},"
+            "setpts=PTS-STARTPTS,"
+            f"scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=decrease,"
+            f"pad={WIDTH}:{HEIGHT}:(ow-iw)/2:(oh-ih)/2:black,"
+            "setsar=1[thumb_v]"
+        )
+
+    filters.append(
+        f"anullsrc=r=48000:cl=stereo,atrim=duration={frame_duration:.6f}[thumb_a]"
+    )
+    concat_parts.append("[thumb_v][thumb_a]")
+
     for zero_based_index, segment in enumerate(segments):
         video_trim = (
             f"[0:v]trim=start={segment.start:.3f}:end={segment.end:.3f},"
@@ -1334,7 +1397,7 @@ def build_filter_complex(
 
     filters.append(
         "".join(concat_parts)
-        + f"concat=n={len(segments)}:v=1:a=1[concat_v][concat_a]"
+        + f"concat=n={len(segments) + 1}:v=1:a=1[concat_v][concat_a]"
     )
     video_label = "concat_v"
     if burn_subtitles:
@@ -1346,7 +1409,7 @@ def build_filter_complex(
                 f"overlay=shortest=1:"
                 f"x=(main_w-overlay_w)/2:"
                 f"y=main_h-{SUBTITLE_BOTTOM_MARGIN}-overlay_h:"
-                f"enable='between(t,{subtitle_card.start:.3f},{subtitle_card.end:.3f})'"
+                f"enable='between(t,{subtitle_card.start + subtitle_offset:.3f},{subtitle_card.end + subtitle_offset:.3f})'"
                 f"[{next_label}]"
             )
             video_label = next_label
@@ -1363,9 +1426,13 @@ def render_video(
     include_audio: bool,
 ) -> Path:
     image_segments = [segment for segment in segments if segment.broll_file]
+    opening_thumbnail_broll_file = find_opening_thumbnail_broll_file(broll_dir)
     image_inputs: dict[str, int] = {}
     command = ["ffmpeg", "-y", "-i", str(video_path)]
-    for position, segment in enumerate(image_segments, start=1):
+    if opening_thumbnail_broll_file:
+        image_inputs[opening_thumbnail_broll_file] = 1
+        command.extend(["-loop", "1", "-i", str(broll_dir / opening_thumbnail_broll_file)])
+    for position, segment in enumerate(image_segments, start=len(image_inputs) + 1):
         image_inputs[segment.broll_file] = position
         command.extend(["-loop", "1", "-i", str(broll_dir / segment.broll_file)])
 
@@ -1380,6 +1447,7 @@ def render_video(
         subtitle_cards=subtitle_cards,
         burn_subtitles=bool(subtitle_cards),
         fps=fps,
+        opening_thumbnail_broll_file=opening_thumbnail_broll_file,
     )
     output_path = output_dir / "final_edit.mp4"
     command.extend(

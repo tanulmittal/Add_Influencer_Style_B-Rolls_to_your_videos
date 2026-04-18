@@ -18,6 +18,7 @@ The tool:
 - generates `output/transcript.srt`
 - builds an edit plan and B-roll prompts
 - creates placeholder B-roll images in `broll/`
+- creates `broll/thumbnail.png` and prepends it as a 1-frame opening thumbnail
 - renders `output/final_edit.mp4`
 
 ## Requirements
@@ -60,6 +61,7 @@ After `create.py` runs, the folder will look like this:
 your-project/
 ├── video.mp4
 ├── broll/
+│   ├── thumbnail.png
 │   ├── 02_*.png
 │   └── ...
 └── output/
@@ -84,6 +86,7 @@ What gets generated:
 - `output/word_timestamps.json`: Groq word timings used for subtitle sync
 - `output/edit_plan.json`: segment timing and template plan
 - `output/broll_prompts.md`: image prompts for each B-roll slot
+- `broll/thumbnail.png`: opening thumbnail frame used at the very start of the render
 - `broll/*.png`: placeholder images you can replace
 - `output/final_edit.mp4`: rendered result
 
