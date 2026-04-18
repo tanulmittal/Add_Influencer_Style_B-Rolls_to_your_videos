@@ -14,12 +14,11 @@ from create import (
     build_subtitle_cards,
     discover_single_file,
     has_audio_stream,
-    load_segments_from_edit_plan,
-    parse_srt,
+    prepare_project_render_inputs,
     prepare_broll_dir,
-    probe_video,
     render_video,
     resolve_subtitle_model,
+    sync_broll_files_by_segment_index,
 )
 
 
@@ -32,14 +31,14 @@ def validate_required_broll_files(broll_dir: Path, segments: list[Segment]) -> N
     if missing_files:
         joined = "\n".join(f"- {name}" for name in missing_files)
         raise SystemExit(
-            "Missing required B-roll files referenced by output/edit_plan.json:\n"
+            "Missing required B-roll files referenced by the rebuilt output/edit_plan.json:\n"
             f"{joined}"
         )
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Rerender a project using the existing output/edit_plan.json and current B-roll files."
+        description="Rerender a project using the current transcript artifacts and B-roll files."
     )
     parser.add_argument("folder", help="Project folder to rerender.")
     parser.add_argument(
@@ -70,11 +69,6 @@ def main() -> int:
         default=WORD_TRANSCRIPT_LANGUAGE,
         help=f"Language code for word-level transcription (default: {WORD_TRANSCRIPT_LANGUAGE}).",
     )
-    parser.add_argument(
-        "--refresh-transcript",
-        action="store_true",
-        help="Ignore cached word timestamps and transcribe the source video again.",
-    )
     parser.set_defaults(burn_subtitles=True)
     args = parser.parse_args()
 
@@ -83,27 +77,22 @@ def main() -> int:
         raise SystemExit(f"{folder} is not a folder.")
 
     output_dir = folder / "output"
-    edit_plan_path = output_dir / "edit_plan.json"
-    transcript_path = output_dir / "transcript.srt"
-    if not edit_plan_path.is_file():
-        raise SystemExit(
-            f"Missing edit plan: {edit_plan_path}. Run create.py {folder.name} first."
-        )
-    if not transcript_path.is_file():
-        raise SystemExit(
-            f"Missing generated transcript: {transcript_path}. Run create.py {folder.name} first."
-        )
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     video_path = discover_single_file(folder, (".mp4", ".mov", ".m4v"))
-    cues = parse_srt(transcript_path)
-    _, fps = probe_video(video_path)
-    segments = load_segments_from_edit_plan(edit_plan_path)
+    subtitle_model = resolve_subtitle_model(args.subtitle_model)
+    cues, segments, fps = prepare_project_render_inputs(
+        video_path=video_path,
+        output_dir=output_dir,
+        model_name=subtitle_model,
+        language=args.subtitle_language,
+    )
     broll_dir = prepare_broll_dir(folder, create=False)
+    sync_broll_files_by_segment_index(broll_dir, segments)
     validate_required_broll_files(broll_dir, segments)
     with tempfile.TemporaryDirectory(prefix=".subtitle_cards_", dir=output_dir) as subtitle_dir:
         subtitle_cards: list[SubtitleCard] = []
         if args.burn_subtitles:
-            subtitle_model = resolve_subtitle_model(args.subtitle_model)
             subtitle_cards = build_subtitle_cards(
                 output_dir=output_dir,
                 subtitle_dir=Path(subtitle_dir),
@@ -112,7 +101,6 @@ def main() -> int:
                 subtitle_mode=args.subtitle_mode,
                 subtitle_model=subtitle_model,
                 subtitle_language=args.subtitle_language,
-                refresh_transcript=args.refresh_transcript,
             )
 
         output_path = render_video(

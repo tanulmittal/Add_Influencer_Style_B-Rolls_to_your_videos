@@ -214,6 +214,14 @@ def normalize_word_text(text: str) -> str:
     return cleaned.strip()
 
 
+def normalize_transcript_language(value: str) -> str:
+    cleaned = str(value).strip().lower().replace("_", "-")
+    aliases = {
+        "english": "en",
+    }
+    return aliases.get(cleaned, cleaned)
+
+
 def resolve_subtitle_model(subtitle_model: str | None) -> str:
     return subtitle_model or GROQ_WORD_TRANSCRIPT_MODEL
 
@@ -621,7 +629,11 @@ def should_refresh_transcript_cache(
         return True
     if payload.get("backend") != backend:
         return True
-    if payload.get("model") != model_name or payload.get("language") != language:
+    if payload.get("model") != model_name:
+        return True
+    if normalize_transcript_language(str(payload.get("language", ""))) != normalize_transcript_language(
+        language
+    ):
         return True
     return int(payload.get("source_mtime_ns", -1)) != source_path.stat().st_mtime_ns
 
@@ -656,11 +668,32 @@ def normalize_word_tokens(raw_tokens: object, source_name: str) -> list[WordToke
 
 
 def load_cached_word_tokens(cache_path: Path) -> list[WordToken]:
-    payload = json.loads(cache_path.read_text(encoding="utf-8"))
     try:
-        return normalize_word_tokens(payload.get("tokens"), f"transcript cache {cache_path}")
-    except ValueError as exc:
-        raise SystemExit(str(exc)) from exc
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Invalid transcript cache {cache_path}: {exc}") from exc
+    return normalize_word_tokens(payload.get("tokens"), f"transcript cache {cache_path}")
+
+
+def load_usable_cached_word_tokens(
+    cache_path: Path,
+    source_path: Path,
+    backend: str,
+    model_name: str,
+    language: str,
+) -> list[WordToken] | None:
+    if should_refresh_transcript_cache(
+        cache_path,
+        source_path,
+        backend,
+        model_name,
+        language,
+    ):
+        return None
+    try:
+        return load_cached_word_tokens(cache_path)
+    except ValueError:
+        return None
 
 
 def save_word_tokens_cache(
@@ -676,7 +709,7 @@ def save_word_tokens_cache(
         "source_mtime_ns": source_path.stat().st_mtime_ns,
         "backend": backend,
         "model": model_name,
-        "language": language,
+        "language": normalize_transcript_language(language),
         "tokens": [asdict(token) for token in tokens],
     }
     cache_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -887,17 +920,17 @@ def transcribe_word_tokens(
     output_dir: Path,
     model_name: str,
     language: str,
-    refresh: bool,
 ) -> list[WordToken]:
     cache_path = output_dir / "word_timestamps.json"
-    if not refresh and not should_refresh_transcript_cache(
+    cached_tokens = load_usable_cached_word_tokens(
         cache_path,
         video_path,
         "groq",
         model_name,
         language,
-    ):
-        return load_cached_word_tokens(cache_path)
+    )
+    if cached_tokens is not None:
+        return cached_tokens
 
     detected_language, tokens, _ = generate_transcript_artifacts(
         video_path=video_path,
@@ -922,21 +955,10 @@ def ensure_project_transcript(
     output_dir: Path,
     model_name: str,
     language: str,
-    refresh: bool,
 ) -> list[Cue]:
     cache_path = output_dir / "word_timestamps.json"
     transcript_path = output_dir / "transcript.srt"
-    if (
-        not refresh
-        and transcript_path.is_file()
-        and not should_refresh_transcript_cache(
-            cache_path,
-            video_path,
-            "groq",
-            model_name,
-            language,
-        )
-    ):
+    if transcript_path.is_file():
         return parse_srt(transcript_path)
 
     detected_language, tokens, cues = generate_transcript_artifacts(
@@ -993,7 +1015,6 @@ def build_word_subtitle_cards(
     video_path: Path,
     model_name: str,
     language: str,
-    refresh: bool,
 ) -> list[SubtitleCard]:
     subtitle_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1002,7 +1023,6 @@ def build_word_subtitle_cards(
         output_dir=output_dir,
         model_name=model_name,
         language=language,
-        refresh=refresh,
     )
     font_path = pick_inter_font()
     subtitle_cards: list[SubtitleCard] = []
@@ -1039,7 +1059,6 @@ def build_subtitle_cards(
     subtitle_mode: str,
     subtitle_model: str,
     subtitle_language: str,
-    refresh_transcript: bool,
 ) -> list[SubtitleCard]:
     if subtitle_mode == "cue":
         return build_cue_subtitle_cards(subtitle_dir, cues)
@@ -1050,7 +1069,6 @@ def build_subtitle_cards(
             video_path=video_path,
             model_name=subtitle_model,
             language=subtitle_language,
-            refresh=refresh_transcript,
         )
     except GroqTranscriptionError as exc:
         print(
@@ -1123,6 +1141,39 @@ def write_edit_plan(
     output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
+def rebuild_project_edit_plan(
+    video_path: Path,
+    output_dir: Path,
+    cues: list[Cue],
+) -> tuple[list[Segment], int]:
+    duration, fps = probe_video(video_path)
+    segments = build_segments(cues, duration)
+    assign_templates(segments)
+    write_edit_plan(
+        output_dir / "edit_plan.json",
+        video_path,
+        output_dir / "transcript.srt",
+        segments,
+    )
+    return segments, fps
+
+
+def prepare_project_render_inputs(
+    video_path: Path,
+    output_dir: Path,
+    model_name: str,
+    language: str,
+) -> tuple[list[Cue], list[Segment], int]:
+    cues = ensure_project_transcript(
+        video_path=video_path,
+        output_dir=output_dir,
+        model_name=model_name,
+        language=language,
+    )
+    segments, fps = rebuild_project_edit_plan(video_path, output_dir, cues)
+    return cues, segments, fps
+
+
 def prepare_broll_dir(folder: Path, create: bool) -> Path:
     canonical_dir = folder / "broll"
     legacy_dir = folder / "B_roll"
@@ -1135,6 +1186,24 @@ def prepare_broll_dir(folder: Path, create: bool) -> Path:
     if create:
         canonical_dir.mkdir(parents=True, exist_ok=True)
     return canonical_dir
+
+
+def sync_broll_files_by_segment_index(broll_dir: Path, segments: list[Segment]) -> None:
+    if not broll_dir.exists():
+        return
+    for segment in segments:
+        if not segment.broll_file:
+            continue
+        expected_path = broll_dir / segment.broll_file
+        if expected_path.exists():
+            continue
+        legacy_matches = sorted(
+            path
+            for path in broll_dir.glob(f"{segment.index:02d}_*.png")
+            if path.is_file() and path != expected_path
+        )
+        if len(legacy_matches) == 1:
+            legacy_matches[0].rename(expected_path)
 
 
 def load_segments_from_edit_plan(edit_plan_path: Path) -> list[Segment]:
@@ -1387,11 +1456,6 @@ def main() -> int:
         default=WORD_TRANSCRIPT_LANGUAGE,
         help=f"Language code for word-level transcription (default: {WORD_TRANSCRIPT_LANGUAGE}).",
     )
-    parser.add_argument(
-        "--refresh-transcript",
-        action="store_true",
-        help="Ignore cached word timestamps and transcribe the source video again.",
-    )
     parser.set_defaults(burn_subtitles=True)
     args = parser.parse_args()
 
@@ -1403,16 +1467,12 @@ def main() -> int:
     output_dir = folder / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
     subtitle_model = resolve_subtitle_model(args.subtitle_model)
-    cues = ensure_project_transcript(
+    cues, segments, fps = prepare_project_render_inputs(
         video_path=video_path,
         output_dir=output_dir,
         model_name=subtitle_model,
         language=args.subtitle_language,
-        refresh=args.refresh_transcript,
     )
-    duration, fps = probe_video(video_path)
-    segments = build_segments(cues, duration)
-    assign_templates(segments)
 
     broll_dir = prepare_broll_dir(folder, create=True)
 
@@ -1422,8 +1482,6 @@ def main() -> int:
         overwrite=args.overwrite_placeholders,
     )
     remove_unused_broll_files(broll_dir, segments)
-    transcript_path = output_dir / "transcript.srt"
-    write_edit_plan(output_dir / "edit_plan.json", video_path, transcript_path, segments)
     generate_broll_prompts_for_project(folder)
     with tempfile.TemporaryDirectory(prefix=".subtitle_cards_", dir=output_dir) as subtitle_dir:
         subtitle_cards: list[SubtitleCard] = []
@@ -1436,7 +1494,6 @@ def main() -> int:
                 subtitle_mode=args.subtitle_mode,
                 subtitle_model=subtitle_model,
                 subtitle_language=args.subtitle_language,
-                refresh_transcript=args.refresh_transcript,
             )
         output_path = render_video(
             video_path=video_path,
