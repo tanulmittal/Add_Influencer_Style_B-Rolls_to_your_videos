@@ -35,7 +35,7 @@ SUBTITLE_BOX_FILL = (0, 0, 0, 191)
 SUBTITLE_TEXT_FILL = (255, 255, 255, 255)
 SUBTITLE_ACTIVE_TEXT_FILL = (255, 232, 115, 255)
 BROLL_START_ZOOM = 1.0
-BROLL_END_ZOOM = 1.1
+BROLL_END_ZOOM = 1.05
 MIN_EDGE_DURATION = 1.0
 MAX_EDGE_DURATION = 3.0
 MIDDLE_BROLL_DURATION = 2.0
@@ -1097,11 +1097,7 @@ def broll_dimensions_for_template(template: str) -> tuple[int, int]:
     return WIDTH, HEIGHT
 
 
-def broll_frame_count(duration: float, fps: int) -> int:
-    return max(1, round(duration * fps))
-
-
-def build_broll_zoompan_filter(
+def build_broll_motion_filter(
     input_index: int,
     output_label: str,
     output_width: int,
@@ -1109,21 +1105,29 @@ def build_broll_zoompan_filter(
     duration: float,
     fps: int,
 ) -> str:
-    frame_count = broll_frame_count(duration, fps)
-    zoom_span = max(frame_count - 1, 1)
+    safe_duration = max(duration, 0.001)
+    progress_expr = f"min(1,max(0,t/{safe_duration:.6f}))"
     zoom_expr = (
-        f"min({BROLL_END_ZOOM:.3f},"
-        f"{BROLL_START_ZOOM:.3f}+({BROLL_END_ZOOM - BROLL_START_ZOOM:.3f}*on/{zoom_span}))"
+        f"{BROLL_START_ZOOM:.3f}"
+        f"+({BROLL_END_ZOOM - BROLL_START_ZOOM:.3f}*{progress_expr})"
     )
+    cover_scale_expr = f"max({output_width}/iw,{output_height}/ih)"
+    scaled_width_expr = f"2*ceil(iw*{cover_scale_expr}*({zoom_expr})/2)"
+    scaled_height_expr = f"2*ceil(ih*{cover_scale_expr}*({zoom_expr})/2)"
     return (
-        f"[{input_index}:v]trim=end_frame=1,"
-        f"zoompan=z='{zoom_expr}':"
-        "x='iw/2-(iw/zoom/2)':"
-        "y='ih/2-(ih/zoom/2)':"
-        f"d={frame_count}:"
-        f"s={output_width}x{output_height}:"
+        f"[{input_index}:v]"
+        "loop=loop=-1:size=1:start=0,"
         f"fps={fps},"
         f"trim=duration={duration:.3f},"
+        "setpts=PTS-STARTPTS,"
+        f"scale=w='{scaled_width_expr}':"
+        f"h='{scaled_height_expr}':"
+        "flags=lanczos+accurate_rnd:"
+        "eval=frame,"
+        f"crop=w={output_width}:h={output_height}:"
+        f"x='(iw-{output_width})/2':"
+        f"y='(ih-{output_height})/2':"
+        "exact=1,"
         f"setpts=PTS-STARTPTS[{output_label}]"
     )
 
@@ -1345,7 +1349,7 @@ def build_filter_complex(
                 raise SystemExit(f"Missing B-roll file mapping for segment {segment.index}")
             input_index = image_inputs[segment.broll_file]
             filters.append(
-                build_broll_zoompan_filter(
+                build_broll_motion_filter(
                     input_index=input_index,
                     output_label=f"b{zero_based_index}",
                     output_width=WIDTH,
@@ -1373,7 +1377,7 @@ def build_filter_complex(
                 raise SystemExit(f"Missing B-roll file mapping for segment {segment.index}")
             input_index = image_inputs[segment.broll_file]
             filters.append(
-                build_broll_zoompan_filter(
+                build_broll_motion_filter(
                     input_index=input_index,
                     output_label=f"v{zero_based_index}",
                     output_width=WIDTH,
