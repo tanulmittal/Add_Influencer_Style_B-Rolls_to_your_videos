@@ -1106,9 +1106,7 @@ def build_broll_motion_filter(
     fps: int,
 ) -> str:
     safe_duration = max(duration, 0.001)
-    total_frames = max(1, math.ceil(safe_duration * fps))
-    zoom_frame_span = max(total_frames - 1, 1)
-    progress_expr = f"min(1,max(0,on/{zoom_frame_span}))"
+    progress_expr = f"min(1,max(0,t/{safe_duration:.6f}))"
     zoom_expr = (
         f"{BROLL_START_ZOOM:.3f}"
         f"+({BROLL_END_ZOOM - BROLL_START_ZOOM:.3f}*{progress_expr})"
@@ -1116,27 +1114,30 @@ def build_broll_motion_filter(
     cover_scale_expr = f"max({output_width}/iw,{output_height}/ih)"
     normalized_width_expr = f"2*ceil(iw*{cover_scale_expr}/2)"
     normalized_height_expr = f"2*ceil(ih*{cover_scale_expr}/2)"
-    center_x_expr = f"(iw-{output_width}/zoom)/2"
-    center_y_expr = f"(ih-{output_height}/zoom)/2"
+    zoomed_width_expr = f"2*ceil(iw*({zoom_expr})/2)"
+    zoomed_height_expr = f"2*ceil(ih*({zoom_expr})/2)"
     return (
         f"[{input_index}:v]"
-        "trim=end_frame=1,"
+        "loop=loop=-1:size=1:start=0,"
+        f"fps={fps},"
+        f"trim=duration={duration:.3f},"
         "setpts=PTS-STARTPTS,"
         f"scale=w='{normalized_width_expr}':"
         f"h='{normalized_height_expr}':"
         "flags=lanczos+accurate_rnd:"
-        "eval=init,"
+        "eval=frame,"
         f"crop=w={output_width}:h={output_height}:"
         f"x='(iw-{output_width})/2':"
         f"y='(ih-{output_height})/2':"
         "exact=1,"
-        f"zoompan=z='{zoom_expr}':"
-        f"x='{center_x_expr}':"
-        f"y='{center_y_expr}':"
-        f"d={total_frames}:"
-        f"s={output_width}x{output_height}:"
-        f"fps={fps},"
-        f"trim=duration={duration:.3f},"
+        f"scale=w='{zoomed_width_expr}':"
+        f"h='{zoomed_height_expr}':"
+        "flags=lanczos+accurate_rnd:"
+        "eval=frame,"
+        f"crop=w={output_width}:h={output_height}:"
+        f"x='(iw-{output_width})/2':"
+        f"y='(ih-{output_height})/2':"
+        "exact=1,"
         f"setpts=PTS-STARTPTS[{output_label}]"
     )
 
