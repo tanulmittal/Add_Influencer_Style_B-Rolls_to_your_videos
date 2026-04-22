@@ -36,6 +36,7 @@ SUBTITLE_TEXT_FILL = (255, 255, 255, 255)
 SUBTITLE_ACTIVE_TEXT_FILL = (255, 232, 115, 255)
 BROLL_START_ZOOM = 1.0
 BROLL_END_ZOOM = 1.05
+BROLL_SUPERSAMPLE_FACTOR = 4
 MIN_EDGE_DURATION = 1.0
 MAX_EDGE_DURATION = 3.0
 MIDDLE_BROLL_DURATION = 2.0
@@ -1106,40 +1107,46 @@ def build_broll_motion_filter(
     fps: int,
 ) -> str:
     safe_duration = max(duration, 0.001)
+    render_width = output_width * BROLL_SUPERSAMPLE_FACTOR
+    render_height = output_height * BROLL_SUPERSAMPLE_FACTOR
     progress_expr = f"min(1,max(0,t/{safe_duration:.6f}))"
     zoom_expr = (
         f"{BROLL_START_ZOOM:.3f}"
         f"+({BROLL_END_ZOOM - BROLL_START_ZOOM:.3f}*{progress_expr})"
     )
-    cover_scale_expr = f"max({output_width}/iw,{output_height}/ih)"
-    normalized_width_expr = f"2*ceil(iw*{cover_scale_expr}/2)"
-    normalized_height_expr = f"2*ceil(ih*{cover_scale_expr}/2)"
-    zoomed_width_expr = f"2*ceil(iw*({zoom_expr})/2)"
-    zoomed_height_expr = f"2*ceil(ih*({zoom_expr})/2)"
-    return (
+    cover_scale_expr = f"max({render_width}/iw,{render_height}/ih)"
+    zoomed_width_expr = f"2*ceil(iw*({cover_scale_expr})*({zoom_expr})/2)"
+    zoomed_height_expr = f"2*ceil(ih*({cover_scale_expr})*({zoom_expr})/2)"
+    canvas_label = f"{output_label}_canvas"
+    scaled_label = f"{output_label}_scaled"
+    # Animate on a larger fixed canvas, then downscale to the delivery slot.
+    canvas_filter = (
+        f"color=c=black:s={render_width}x{render_height}:r={fps}:d={duration:.3f}"
+        f"[{canvas_label}]"
+    )
+    scaled_input_filter = (
         f"[{input_index}:v]"
         "loop=loop=-1:size=1:start=0,"
         f"fps={fps},"
         f"trim=duration={duration:.3f},"
         "setpts=PTS-STARTPTS,"
-        f"scale=w='{normalized_width_expr}':"
-        f"h='{normalized_height_expr}':"
-        "flags=lanczos+accurate_rnd:"
-        "eval=frame,"
-        f"crop=w={output_width}:h={output_height}:"
-        f"x='(iw-{output_width})/2':"
-        f"y='(ih-{output_height})/2':"
-        "exact=1,"
         f"scale=w='{zoomed_width_expr}':"
         f"h='{zoomed_height_expr}':"
         "flags=lanczos+accurate_rnd:"
         "eval=frame,"
-        f"crop=w={output_width}:h={output_height}:"
-        f"x='(iw-{output_width})/2':"
-        f"y='(ih-{output_height})/2':"
-        "exact=1,"
+        f"setpts=PTS-STARTPTS[{scaled_label}]"
+    )
+    composite_filter = (
+        f"[{canvas_label}][{scaled_label}]"
+        "overlay="
+        "x='(W-w)/2':"
+        "y='(H-h)/2':"
+        "eval=frame:"
+        "shortest=1,"
+        f"scale=w={output_width}:h={output_height}:flags=lanczos+accurate_rnd,"
         f"setpts=PTS-STARTPTS[{output_label}]"
     )
+    return ";".join([canvas_filter, scaled_input_filter, composite_filter])
 
 
 def remove_unused_broll_files(broll_dir: Path, segments: list[Segment]) -> None:
